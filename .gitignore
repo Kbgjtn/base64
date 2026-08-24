@@ -1,0 +1,9 @@
+# ---> Zig
+.zig-cache/
+zig-out/
+*.o
+zig-pkg/
+build/
+build-*/
+docgen_tmp/
+
