@@ -20,12 +20,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const native_endian = builtin.target.cpu.arch.endian();
 
-const six_bit_mask: u8 = 0x3f;
+const little_endian_only = builtin.target.cpu.arch.endian() == .little;
+
 const VecIn = @Vector(24, u8);
 const Vec16 = @Vector(16, u8);
 const Vec32 = @Vector(32, u8);
+
+const Vec16u16 = @Vector(16, u16);
 
 // WARN!: this @bitCast assumes a little-endian target.
 //
@@ -41,127 +43,271 @@ const Vec32u16 = @Vector(32, u16);
 
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// Per four-lane group over a 3-byte triple (a,b,c)
-// lane0 = a>>2             lane1 = (a<<4 | b>>4) & 0x3f
-// lane2 = (b<<2 | c>>6)    lane3 = c & 0x3f
+/// Converts 6-bit values in the range 0..63 to Base64 ASCII.
+inline fn translate(
+    comptime N: comptime_int,
+    v: @Vector(N, u8),
+) @Vector(N, u8) {
+    const Vec = @Vector(N, u8);
 
-const hi_idx = blk: {
-    var idx: [32]i32 = undefined;
-    for (0..8) |g| {
-        idx[4 * g + 0] = 3 * g + 0; // a
-        idx[4 * g + 1] = 3 * g + 0; // a
-        idx[4 * g + 2] = 3 * g + 1; // b
-        idx[4 * g + 3] = 3 * g + 2; // c
-    }
-    break :blk idx;
-};
-const lo_idx = blk: {
-    var idx: [32]i32 = undefined;
-    for (0..8) |g| {
-        idx[4 * g + 0] = 3 * g + 0; // a
-        idx[4 * g + 1] = 3 * g + 1; // b
-        idx[4 * g + 2] = 3 * g + 2; // c
-        idx[4 * g + 3] = 3 * g + 2; // c
-    }
-    break :blk idx;
-};
+    const zero: Vec = @splat(0);
 
-// Load-time permutation: gather source bytes 0..11 into input lane 0
-// (positions 0..11) and bytes 12..23 into lane 1 (positions 16..27).
-// a = source[i..i+16], b = source[i+8..i+24] (overlapping load).
-// In @shuffle mask terms: positive n = a[n], ~n = b[n].
-const load_idx = blk: {
-    var idx: [32]i32 = undefined;
-    for (0..12) |j| idx[j] = @intCast(j); // lane0: a[0..12] = bytes 0..11
-    for (12..16) |j| idx[j] = 0; // padding (unused)
-    for (0..12) |j| idx[16 + j] = ~@as(i32, @intCast(4 + j)); // lane1: b[4..16] = bytes 12..23
-    for (28..32) |j| idx[j] = 0; // padding (unused)
-    break :blk idx;
-};
+    var off: Vec = @splat(65); // 'A'
 
-// Interleaved [lo, hi] byte pairs. When bitcast to u16 lanes
-// (little-endian), each pair forms w = (hi << 8) | lo, from which
-// the 6-bit value is (w >> shift) & 0x3f.
-//
-// Per 3-byte group (a,b,c) → 4 output lanes → 8 bytes:
-//   lane0: a>>2            → w = a<<8|a, shift 10
-//   lane1: (a<<4|b>>4)&63  → w = a<<8|b, shift 4
-//   lane2: (b<<2|c>>6)&63  → w = b<<8|c, shift 6
-//   lane3: c&63            → w = c<<8|c, shift 0
-// const pair_idx = blk: {
-//     const orig = [8]u6{ 0, 0, 1, 0, 2, 1, 2, 2 }; // [lo,hi] per lane
-//     var idx: [64]i32 = undefined;
-//     for (0..8) |g| {
-//         for (0..8) |k| {
-//             const x = 3 * g + orig[k];
-//             idx[8 * g + k] = if (x < 12) x else x + 4;
-//         }
-//     }
-//     break :blk idx;
-// };
+    // 0..25  => 'A'..'Z'
+    // 26..51 => 'a'..'z'
+    // 52..61 => '0'..'9'
+    // 62     => '+'
+    // 63     => '/'
+    off +%= @select(
+        u8,
+        v > @as(Vec, @splat(25)),
+        @as(Vec, @splat(6)),
+        zero,
+    );
 
-const pair_idx = blk: {
-    const orig = [_]u6{ 0, 0, 1, 0, 2, 1, 2, 2 };
+    off -%= @select(
+        u8,
+        v > @as(Vec, @splat(51)),
+        @as(Vec, @splat(75)),
+        zero,
+    );
 
-    var idx: [64]i32 = undefined;
-    for (0..8) |g| {
+    off -%= @select(
+        u8,
+        v == @as(Vec, @splat(62)),
+        @as(Vec, @splat(15)),
+        zero,
+    );
+
+    off -%= @select(
+        u8,
+        v == @as(Vec, @splat(63)),
+        @as(Vec, @splat(12)),
+        zero,
+    );
+
+    return v +% off;
+}
+
+/// Builds the [lo, hi] byte-pair expansion mask.
+///
+/// Each input triple [a, b, c] becomes:
+///
+///     [a, a, b, a, c, b, c, c]
+///
+/// The resulting byte pairs are:
+///
+///     [a, a] [b, a] [c, b] [c, c]
+///
+/// The caller supplies lane_pos because the 32-byte path has a four-byte
+/// gap between its two overlapping loads, while the 16-byte path does not.
+fn makePairIdx(
+    comptime groups: usize,
+    comptime lane_pos: fn (usize) usize,
+) [groups * 8]i32 {
+    const orig = [_]u6{
+        0, 0, 1, 0,
+        2, 1, 2, 2,
+    };
+
+    var idx: [groups * 8]i32 = undefined;
+
+    for (0..groups) |g| {
         for (0..8) |k| {
-            const source = 3 * g + orig[k];
-            idx[8 * g + k] = @intCast(
-                if (source < 12) source else source + 4,
+            const source =
+                3 * g + @as(usize, orig[k]);
+
+            idx[8 * g + k] = @intCast(lane_pos(source));
+        }
+    }
+
+    return idx;
+}
+
+const pair_idx = makePairIdx(
+    8,
+    struct {
+        fn f(s: usize) usize {
+            // Source bytes 0..11 are in chunk positions 0..11.
+            // Source bytes 12..23 are in chunk positions 16..27.
+            return if (s < 12) s else s + 4;
+        }
+    }.f,
+);
+
+const pair_idx16 = makePairIdx(
+    4,
+    struct {
+        fn f(s: usize) usize {
+            return s;
+        }
+    }.f,
+);
+
+/// Builds a shuffle mask that packs bytes from two overlapping loads.
+///
+/// Positive indices select from the first shuffle operand.
+/// Bitwise-complemented indices select from the second operand.
+fn makeLoadIdx(
+    comptime output_width: usize,
+    comptime a_count: usize,
+    comptime b_output_offset: usize,
+    comptime b_source_offset: usize,
+    comptime b_count: usize,
+) [output_width]i32 {
+    var idx: [output_width]i32 = undefined;
+
+    // Padding is unused by the subsequent masks. Zero is a valid value.
+    for (0..output_width) |j| {
+        idx[j] = 0;
+    }
+
+    for (0..a_count) |j| {
+        idx[j] = @intCast(j);
+    }
+
+    for (0..b_count) |j| {
+        const source_index: i32 =
+            @intCast(b_source_offset + j);
+
+        idx[b_output_offset + j] = ~source_index;
+    }
+
+    return idx;
+}
+
+// a = source[i..i+16]
+// b = source[i+8..i+24]
+//
+// Result:
+//   chunk[0..12]  = source[0..12]
+//   chunk[16..28] = source[12..24]
+const load_idx = makeLoadIdx(
+    32,
+    12,
+    16,
+    4,
+    12,
+);
+
+// a = source[i..i+8]
+// b = source[i+4..i+12]
+//
+// Result:
+//   chunk[0..8] = source[0..8]
+//   chunk[8..12] = source[8..12]
+const load_idx16 = makeLoadIdx(
+    16,
+    8,
+    8,
+    4,
+    4,
+);
+
+fn makeShifts(
+    comptime lanes: usize,
+    comptime quad: [4]u4,
+) @Vector(lanes, u16) {
+    comptime {
+        if (lanes % 4 != 0) {
+            @compileError("makeShifts: lane count must be divisible by 4");
+        }
+    }
+
+    const Vec = @Vector(lanes, u16);
+    var result: Vec = undefined;
+
+    for (0..lanes / 4) |group| {
+        for (0..4) |lane| {
+            result[4 * group + lane] = @as(u16, quad[lane]);
+        }
+    }
+
+    return result;
+}
+
+const shifts = makeShifts(32, .{
+    10, 4, 6, 0,
+});
+
+const shifts16 = makeShifts(16, .{
+    2, 4, 6, 0,
+});
+
+inline fn encodeChunk(source: []const u8, i: usize) Vec32 {
+    comptime {
+        if (!little_endian_only) {
+            @compileError(
+                "encodeChunk: @bitCast(pair bytes -> u16) requires little-endian",
             );
         }
     }
-    break :blk idx;
-};
 
-const shifts: Vec32u16 = blk: {
-    var s: [32]u16 = undefined;
-    for (0..8) |g| {
-        s[4 * g + 0] = 10; // (a<<8|a) >> 10 = a>>2
-        s[4 * g + 1] = 4; // (a<<8|b) >> 4  = a<<4|b>>4
-        s[4 * g + 2] = 6; // (b<<8|c) >> 6  = (b&0xf)<<2|c>>6
-        s[4 * g + 3] = 0; // (c<<8|c)       = c
-    }
-    break :blk s;
-};
+    const a: Vec16 =
+        source[i..][0..16].*;
 
-inline fn encodeChunk(source: []const u8, i: usize) Vec32 {
-    // encodeChunk relies on little-endian u16 lane decoding;
+    const b: Vec16 =
+        source[i + 8 ..][0..16].*;
+
+    const chunk: Vec32 =
+        @shuffle(u8, a, b, load_idx);
+
+    // Each pair is laid out as [lo, hi].
+    // On little-endian targets, @bitCast interprets this as:
     //
-    // See the note at the @bitCast. Fail the build rather than emit wrong output on BE.
+    //     w = (hi << 8) | lo
+    //
+    const pairs: @Vector(64, u8) =
+        @shuffle(u8, chunk, undefined, pair_idx);
+
+    const w: Vec32u16 =
+        @bitCast(pairs);
+
+    const v: Vec32 =
+        @truncate(
+            (w >> shifts) &
+                @as(Vec32u16, @splat(0x3f)),
+        );
+
+    return translate(32, v);
+}
+
+inline fn encodeChunk16(source: []const u8, i: usize) Vec16 {
     comptime {
-        switch (native_endian) {
-            .little => {},
-            .big => @compileError(
-                "encodeChunk: @bitCast(pair bytes → u16) assumes little-endian lane ordering",
-            ),
+        if (!little_endian_only) {
+            @compileError(
+                "encodeChunk16: @bitCast(pair bytes -> u16) requires little-endian",
+            );
         }
     }
 
-    const a: Vec16 = source[i..][0..16].*;
-    const b: Vec16 = source[i + 8 ..][0..16].*; // overlap; i+24 <= len
-    const chunk: Vec32 = @shuffle(u8, a, b, load_idx);
+    const a: @Vector(8, u8) =
+        source[i..][0..8].*;
 
-    // In-lane pair expansion; bitcast gives w = (hi << 8) | lo per u16 lane.
-    const pairs: @Vector(64, u8) = @shuffle(u8, chunk, undefined, pair_idx);
-    const w: Vec32u16 = @bitCast(pairs);
+    const b: @Vector(8, u8) =
+        source[i + 4 ..][0..8].*;
 
-    const v: Vec32 = @truncate((w >> shifts) & @as(Vec32u16, @splat(0x3f)));
+    const chunk: Vec16 =
+        @shuffle(u8, a, b, load_idx16);
 
-    const gt25 = v > @as(Vec32, @splat(25));
-    const gt51 = v > @as(Vec32, @splat(51));
-    const eq62 = v == @as(Vec32, @splat(62));
-    const eq63 = v == @as(Vec32, @splat(63));
+    // pair_idx16 only references positions 0..11, so the second
+    // shuffle operand is not logically used. Keep it defined anyway.
+    const zero: Vec16 = @splat(0);
 
-    const zero: Vec32 = @splat(0);
-    var off: Vec32 = @splat(65);
-    off +%= @select(u8, gt25, @as(Vec32, @splat(6)), zero);
-    off -%= @select(u8, gt51, @as(Vec32, @splat(75)), zero);
-    off -%= @select(u8, eq62, @as(Vec32, @splat(15)), zero);
-    off -%= @select(u8, eq63, @as(Vec32, @splat(12)), zero);
+    const pairs: @Vector(32, u8) =
+        @shuffle(u8, chunk, zero, pair_idx16);
 
-    return v +% off;
+    const w: Vec16u16 =
+        @bitCast(pairs);
+
+    const v: Vec16 =
+        @truncate(
+            (w >> shifts16) &
+                @as(Vec16u16, @splat(0x3f)),
+        );
+
+    return translate(16, v);
 }
 
 /// Returns the padded Base64 output size.
@@ -238,7 +384,6 @@ pub const Encoder = struct {
         var dest_index: usize = 0;
 
         // Fast scalar path for inputs too short for the vector loop;
-        //
         // skips hoisting the ymm constants entirely.
         if (source_len >= 24) {
             @branchHint(.likely);
@@ -248,6 +393,32 @@ pub const Encoder = struct {
             }) {
                 dest[dest_index..][0..32].* = encodeChunk(source, source_index);
             }
+        }
+
+        // 12 bytes -> 16 chars, half-width version of encodeChunk.
+        // No lane crossing at all: a single 16-byte shuffle does the
+        // whole pair expansion.
+        // if (source_len - source_index >= 12) {
+        //     const c: Vec16 = source[source_index..][0..16].*; // reads 16, uses 12
+        //     // pair_idx16: for g in 0..4, emit [3g, 3g, 3g+1, 3g, 3g+1,
+        //     //            3g+2, 3g+2, 3g+2] — same orig table, 4 groups
+        //     const pairs: @Vector(32, u8) = @shuffle(u8, c, undefined, pair_idx16);
+        //     const w: @Vector(16, u16) = @bitCast(pairs);
+        //     const v: Vec16 = @truncate((w >> shifts16) & @as(@Vector(16, u16), @splat(0x3f)));
+        //
+        //     // same compare/select ladder as encodeChunk, at Vec16 width
+        //     dest[dest_index..][0..16].* = v +% off16;
+        //     source_index += 12;
+        //     dest_index += 16;
+        // }
+
+        // xmm half-chunk: 12 bytes -> 16 chars for the 12..23 byte band.
+        // Runs at most once (remaining < 24 here); the @Vector(16) ops
+        // stay in xmm registers with no lane-crossing at all.
+        if (source_index + 12 <= source_len) {
+            dest[dest_index..][0..16].* = encodeChunk16(source, source_index);
+            source_index += 12;
+            dest_index += 16;
         }
 
         // Process exactly 3 source bytes as 4 Base64 characters
@@ -688,114 +859,99 @@ test "vector encoder matches std on boundary lengths" {
     }
 }
 
-// test "Base64 encode/decode roundtrip and boundary sizes" {
-//     const allocator = std.testing.allocator;
-//     var prng = std.Random.DefaultPrng.init(0xdeadbeef);
-//     const random = prng.random();
-//
-//     // Exhaustively cover every size around the encoder/decoder tier
-//     // boundaries (3/4-byte scalar tail, 12/16-byte batched tiers), rather
-//     // than relying on random sampling to eventually hit them.
-//     var size: usize = 0;
-//     while (size <= 40) : (size += 1) {
-//         const input = try allocator.alloc(u8, size);
-//         defer allocator.free(input);
-//         random.bytes(input);
-//
-//         try roundtrip(allocator, input, .reject);
-//     }
-// }
-//
-// test "Encoder known vectors" {
-//     // One test per possible byte-remainder (0, 1, 2 bytes leftover after
-//     // 3-byte grouping), matching std.base64's own hand-picked vectors.
-//     const cases = .{
-//         .{ "", "" },
-//         .{ "f", "Zg==" },
-//         .{ "fo", "Zm8=" },
-//         .{ "foo", "Zm9v" },
-//         .{ "foob", "Zm9vYg==" },
-//         .{ "fooba", "Zm9vYmE=" },
-//         .{ "foobar", "Zm9vYmFy" },
-//         // Long enough to cross the tier-1 (16 source bytes) batch boundary.
-//         .{ "foobarfoobarfoobarfoobarfoobarfoo", "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9v" },
-//     };
-//
-//     inline for (cases) |case| {
-//         const input: []const u8 = case[0];
-//         const expected: []const u8 = case[1];
-//
-//         var buf: [128]u8 = undefined;
-//         const dest = buf[0..computeSize(input.len)];
-//         const n = try Encoder.encodeToSlice(dest, input);
-//         try std.testing.expectEqualSlices(u8, expected, dest[0..n]);
-//
-//         const allocated = try Encoder.encode(std.testing.allocator, input);
-//         defer std.testing.allocator.free(allocated);
-//         try std.testing.expectEqualSlices(u8, expected, allocated);
-//     }
-// }
-//
-// test "Encoder tier boundary sizes" {
-//     // Exhaustively cover sizes around the 4-byte (tier-2) and 16-byte
-//     // (tier-1) batched-encode boundaries, plus the 0/1/2-byte scalar tail.
-//     var prng = std.Random.DefaultPrng.init(0xdeadbeef);
-//     const random = prng.random();
-//
-//     var size: usize = 0;
-//     while (size <= 40) : (size += 1) {
-//         const input = try std.testing.allocator.alloc(u8, size);
-//         defer std.testing.allocator.free(input);
-//         random.bytes(input);
-//
-//         const dest = try std.testing.allocator.alloc(u8, computeSize(size));
-//         defer std.testing.allocator.free(dest);
-//
-//         const n = try Encoder.encodeToSlice(dest, input);
-//         try std.testing.expectEqual(dest.len, n);
-//
-//         // Round-trip through the decoder as an independent correctness
-//         // check on the encoded bytes, rather than re-deriving expected
-//         // base64 text by hand for every size.
-//         const decoded = try Decoder.decode(std.testing.allocator, dest, .reject);
-//         defer std.testing.allocator.free(decoded);
-//         try std.testing.expectEqualSlices(u8, input, decoded);
-//     }
-// }
-//
-// test "Encoder rejects undersized dest" {
-//     // Mirrors std.base64's testNoSpaceLeftError: dest one byte short of
-//     // the required size must fail, not overflow or silently truncate.
-//     const cases = [_][]const u8{ "f", "fo", "foo", "foob", "fooba", "foobar" };
-//
-//     for (cases) |input| {
-//         const required = computeSize(input.len);
-//         if (required == 0) continue;
-//
-//         var buf: [128]u8 = undefined;
-//         const dest = buf[0 .. required - 1];
-//         try std.testing.expectError(error.NoSpaceLeft, Encoder.encodeToSlice(dest, input));
-//     }
-// }
-//
-// test "Encoder tolerates oversized dest" {
-//     // Mirrors std.base64's "base64 padding dest overflow" test: encoding
-//     // into a larger-than-required buffer must still produce the correct
-//     // output in the leading bytes, without requiring an exact-size match.
-//     const input = "foo";
-//     const required = computeSize(input.len);
-//
-//     var exact: [128]u8 = undefined;
-//     @memset(&exact, 0);
-//     const exact_n = try Encoder.encodeToSlice(exact[0..required], input);
-//
-//     var oversized: [128]u8 = undefined;
-//     @memset(&oversized, 0xAA);
-//     const oversized_n = try Encoder.encodeToSlice(&oversized, input);
-//
-//     try std.testing.expectEqual(exact_n, oversized_n);
-//     try std.testing.expectEqualSlices(u8, exact[0..exact_n], oversized[0..oversized_n]);
-// }
+test "Base64 encode/decode roundtrip and boundary sizes" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const random = prng.random();
+
+    // Exhaustively cover every size around the encoder/decoder tier
+    // boundaries (3/4-byte scalar tail, 12/16-byte batched tiers), rather
+    // than relying on random sampling to eventually hit them.
+    var size: usize = 0;
+    while (size <= 40) : (size += 1) {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        random.bytes(input);
+
+        try roundtrip(allocator, input, .reject);
+    }
+}
+
+test "Encoder known vectors" {
+    // One test per possible byte-remainder (0, 1, 2 bytes leftover after
+    // 3-byte grouping), matching std.base64's own hand-picked vectors.
+    const cases = .{
+        .{ "", "" },
+        .{ "f", "Zg==" },
+        .{ "fo", "Zm8=" },
+        .{ "foo", "Zm9v" },
+        .{ "foob", "Zm9vYg==" },
+        .{ "fooba", "Zm9vYmE=" },
+        .{ "foobar", "Zm9vYmFy" },
+        // Long enough to cross the tier-1 (16 source bytes) batch boundary.
+        .{ "foobarfoobarfoobarfoobarfoobarfoo", "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9v" },
+    };
+
+    inline for (cases) |case| {
+        const input: []const u8 = case[0];
+        const expected: []const u8 = case[1];
+
+        var buf: [128]u8 = undefined;
+        const dest = buf[0..computeSize(input.len)];
+        const n = Encoder.encodeToSlice(dest, input);
+        try std.testing.expectEqualSlices(u8, expected, dest[0..n]);
+
+        const allocated = try Encoder.encode(std.testing.allocator, input);
+        defer std.testing.allocator.free(allocated);
+        try std.testing.expectEqualSlices(u8, expected, allocated);
+    }
+}
+
+test "Encoder tier boundary sizes" {
+    // Exhaustively cover sizes around the 4-byte (tier-2) and 16-byte
+    // (tier-1) batched-encode boundaries, plus the 0/1/2-byte scalar tail.
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const random = prng.random();
+
+    var size: usize = 0;
+    while (size <= 40) : (size += 1) {
+        const input = try std.testing.allocator.alloc(u8, size);
+        defer std.testing.allocator.free(input);
+        random.bytes(input);
+
+        const dest = try std.testing.allocator.alloc(u8, computeSize(size));
+        defer std.testing.allocator.free(dest);
+
+        const n = Encoder.encodeToSlice(dest, input);
+        try std.testing.expectEqual(dest.len, n);
+
+        // Round-trip through the decoder as an independent correctness
+        // check on the encoded bytes, rather than re-deriving expected
+        // base64 text by hand for every size.
+        const decoded = try Decoder.decode(std.testing.allocator, dest, .reject);
+        defer std.testing.allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, input, decoded);
+    }
+}
+
+test "Encoder tolerates oversized dest" {
+    // Mirrors std.base64's "base64 padding dest overflow" test: encoding
+    // into a larger-than-required buffer must still produce the correct
+    // output in the leading bytes, without requiring an exact-size match.
+    const input = "foo";
+    const required = computeSize(input.len);
+
+    var exact: [128]u8 = undefined;
+    @memset(&exact, 0);
+    const exact_n = Encoder.encodeToSlice(exact[0..required], input);
+
+    var oversized: [128]u8 = undefined;
+    @memset(&oversized, 0xAA);
+    const oversized_n = Encoder.encodeToSlice(&oversized, input);
+
+    try std.testing.expectEqual(exact_n, oversized_n);
+    try std.testing.expectEqualSlices(u8, exact[0..exact_n], oversized[0..oversized_n]);
+}
 
 test "Decoder known vectors" {
     const cases = .{
