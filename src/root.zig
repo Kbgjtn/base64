@@ -210,6 +210,11 @@ pub fn computeSizeForSlice(source: []const u8) !usize {
     return (len / 4) * 3 - padding;
 }
 
+// TODO!
+// 1. Blocking for std upstreaming: alphabet/pad parameterization and the Codecs shape std's
+// contract is per-variant instances.
+// 2. Nice to have: encodeWriter.
+
 /// A Base64 encoder that supports both buffer-based and allocating encoding.
 pub const Encoder = struct {
     /// Encodes `source` into the caller-provided buffer `dest`, returning
