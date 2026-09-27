@@ -3,10 +3,10 @@
 //!
 //! Base64 works in 3-byte (24-bit) blocks, split into 4 groups of 6 bits.
 //! Each 6-bit group maps to one character of a 64-character alphabet:
-//!   0-25  -> uppercase ASCII letters [A-Z]
-//!   26-51 -> lowercase ASCII letters [a-z]
-//!   52-61 -> digits [0-9]
-//!   62-63 -> `+` and `/`
+//!   0-25  => uppercase ASCII letters [A-Z]
+//!   26-51 => lowercase ASCII letters [a-z]
+//!   52-61 => digits [0-9]
+//!   62-63 => `+` and `/`
 //!
 //! When the input length isn't a multiple of 3 bytes, the output is padded
 //! with `=` so that the encoded length is always a multiple of 4:
@@ -15,13 +15,11 @@
 //!
 //! 3 bytes were chosen as the block size because it's the smallest number
 //! of bytes whose total bit count (n * 8) is evenly divisible by 6:
-//! the smallest n solving `8n % 6 == 0` is n = 3, giving 24 bits -> 4
+//! the smallest n solving `8n % 6 == 0` is n = 3, giving 24 bits => 4
 //! six-bit characters.
 
 const std = @import("std");
 const builtin = @import("builtin");
-
-const simd = @import("simd.zig");
 
 const native_endian = builtin.target.cpu.arch.endian();
 
@@ -44,6 +42,8 @@ comptime {
         @compileError("pair bit-cast operations require a little-endian target");
     }
 }
+
+const simd = @import("simd.zig");
 
 /// Computed once, at comptime, from the actual compilation target, not re-derived here.
 /// See simd_tier.zig; build.zig calls the same function against the resolved build target
@@ -377,13 +377,8 @@ pub const Encoder = struct {
 
             1 => {
                 const first = source[source_index];
-
-                dest[dest_index + 0] =
-                    alphabet[first >> 2];
-
-                dest[dest_index + 1] =
-                    alphabet[(first & 0x03) << 4];
-
+                dest[dest_index + 0] = alphabet[first >> 2];
+                dest[dest_index + 1] = alphabet[(first & 0x03) << 4];
                 dest[dest_index + 2] = '=';
                 dest[dest_index + 3] = '=';
             },
@@ -392,17 +387,9 @@ pub const Encoder = struct {
                 const first = source[source_index];
                 const second = source[source_index + 1];
 
-                dest[dest_index + 0] =
-                    alphabet[first >> 2];
-
-                dest[dest_index + 1] =
-                    alphabet[
-                        ((first & 0x03) << 4) | (second >> 4)
-                    ];
-
-                dest[dest_index + 2] =
-                    alphabet[(second & 0x0f) << 2];
-
+                dest[dest_index + 0] = alphabet[first >> 2];
+                dest[dest_index + 1] = alphabet[((first & 0x03) << 4) | (second >> 4)];
+                dest[dest_index + 2] = alphabet[(second & 0x0f) << 2];
                 dest[dest_index + 3] = '=';
             },
 
