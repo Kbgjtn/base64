@@ -21,313 +21,225 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const little_endian_only = builtin.target.cpu.arch.endian() == .little;
+const simd = @import("simd.zig");
 
-const VecIn = @Vector(24, u8);
-const Vec16 = @Vector(16, u8);
-const Vec32 = @Vector(32, u8);
+const native_endian = builtin.target.cpu.arch.endian();
 
-const Vec16u16 = @Vector(16, u16);
-
-// WARN!: this @bitCast assumes a little-endian target.
+// IMPORTANT! Pair bit-casts require little-endian byte order.
 //
-// `pairs` is laid out as [lo, hi] byte pairs; reinterpreting as u16 lanes produces (hi << 8) | lo
-// ONLY on little-endian. On big-endian the same bytes decode as (lo << 8) | hi, silently corrupting
-// every extracted 6-bit value, wrong output, no crash, full speed.
+// `pairs()` stores each 16-bit value as [low_byte, high_byte].
+// The @bitCast operation below relies on little-endian layout:
 //
-// This is guarded by a @compileError at container scope, so BE targets fail to build rather than
-// miscompile. If BE support is ever needed, the fix is to emit `pair_idx` with swapped [hi, lo]
-// pair order under `builtin.target.cpu.arch.endian() == .big` (purely comptime, zero runtime cost),
-// and verify it under QEMU, since no BE hardware is expected in CI.
-const Vec32u16 = @Vector(32, u16);
+// [lo, hi] => (hi << 8) | lo
+//
+// On a big-endian target, the bytes would be interpreted in the opposite
+// order, it'd producing incorrect 6-bit values without causing a runtime error.
+//
+// A compile-time check rejects big-endian targets. If big-endian support is
+// added later, generate `pair_idx` and `pair_idx16` with [hi, lo] ordering
+// when `builtin.target.cpu.arch.endian() == .big`, then test the results under
+// a big-endian emulator such as QEMU.
+comptime {
+    if (!(native_endian == .little)) {
+        @compileError("pair bit-cast operations require a little-endian target");
+    }
+}
+
+/// Computed once, at comptime, from the actual compilation target, not re-derived here.
+/// See simd_tier.zig; build.zig calls the same function against the resolved build target
+/// so the two can't drift apart.
+const tier: simd.Tier = .fromCpu(builtin.cpu);
+
+/// One 32-byte input/output chunk.
+const Chunk = simd.u8x32;
+
+/// One 16-byte input/output chunk.
+const Chunk16 = simd.u8x16;
+
+/// Sixteen little-endian u16 words, each containing one [lo, hi] pair.
+const Pairs16 = simd.u16x16;
+
+/// Thirty-two little-endian u16 words, each containing one [lo, hi] pair.
+const Pairs = simd.u16x32;
 
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Converts 6-bit values in the range 0..63 to Base64 ASCII.
-inline fn translate(
-    comptime N: comptime_int,
-    v: @Vector(N, u8),
-) @Vector(N, u8) {
-    const Vec = @Vector(N, u8);
+const pair_indices_8_groups = simd.expandTriplePairs(8);
+const pair_indices_4_groups = simd.expandTriplePairs(4);
 
+/// Maps two Base64 sextets to two packed ASCII bytes.
+///
+/// Each entry is stored as a little-endian u16 so the bytes are written in
+/// alphabet order by `writeInt(u16, ..., .little)`.
+const pair_lut: [4096]u16 = blk: {
+    @setEvalBranchQuota(1 << 20);
+    var t: [4096]u16 = undefined;
+    for (&t, 0..) |*e, i| {
+        e.* = @as(u16, alphabet[i >> 6]) |
+            (@as(u16, alphabet[i & 0x3f]) << 8);
+    }
+    break :blk t;
+};
+
+/// Writes the two Base64 characters encoded by `sextets` to `dest[offset..]`.
+///
+/// The upper 6 bits select the first character and the lower 6 bits select
+/// the second character.
+fn writeScalarPair(dest: []u8, i: usize, p: u12) void {
+    std.mem.writeInt(u16, dest[i..][0..2], pair_lut[p], .little);
+}
+
+// Combines two overlapping 16-byte loads into a 32-byte chunk.
+//
+// A contributes source[i .. i+12] at chunk[0 .. 12].
+// B contributes source[i+12 .. i+24] at chunk[16 .. 28].
+// The remaining lanes are padding.
+const load_indices_lanes = simd.loadIndices(
+    32,
+    .{ .src = 0, .dst = 0, .len = 12 },
+    .{ .src = 4, .dst = 16, .len = 12 },
+);
+
+// Combines two overlapping 8-byte loads into a 16-byte chunk.
+//
+// A contributes source[i .. i+8] at chunk[0 .. 8].
+// B contributes source[i+8 .. i+12] at chunk[8 .. 12].
+// The remaining lanes are padding.
+const load_indices_16_lanes = simd.loadIndices(
+    16,
+    .{ .src = 0, .dst = 0, .len = 8 },
+    .{ .src = 4, .dst = 8, .len = 4 },
+);
+
+const shifts_32_lanes = simd.laneShifts(32, .{ 10, 4, 6, 0 });
+const shifts_16_lanes = simd.laneShifts(16, .{ 10, 4, 6, 0 });
+
+/// Converts one Base64 sextet in each lane to its ASCII character.
+///
+/// Every input lane must contain a value in the range `0..63`.
+fn sextetsToAscii(comptime lanes: usize, v: @Vector(lanes, u8)) @Vector(lanes, u8) {
+    const Vec = @Vector(lanes, u8);
     const zero: Vec = @splat(0);
 
-    var off: Vec = @splat(65); // 'A'
+    var offset: Vec = @splat(65); // 'A'
 
-    // 0..25  => 'A'..'Z'
-    // 26..51 => 'a'..'z'
-    // 52..61 => '0'..'9'
-    // 62     => '+'
-    // 63     => '/'
-    off +%= @select(
+    // 26..51: move from 'A'..'Z' to 'a'..'z'.
+    offset +%= @select(
         u8,
         v > @as(Vec, @splat(25)),
         @as(Vec, @splat(6)),
         zero,
     );
 
-    off -%= @select(
+    // 52..63: move to the numeric/symbol range.
+    offset -%= @select(
         u8,
         v > @as(Vec, @splat(51)),
         @as(Vec, @splat(75)),
         zero,
     );
 
-    off -%= @select(
+    // 62 -> '+', 63 -> '/'.
+    // The low bit distinguishes 62 from 63.
+    const tail: Vec =
+        (v & @as(Vec, @splat(1))) *% @as(Vec, @splat(3));
+
+    offset -%= @select(
         u8,
-        v == @as(Vec, @splat(62)),
-        @as(Vec, @splat(15)),
+        v > @as(Vec, @splat(61)),
+        @as(Vec, @splat(15)) -% tail,
         zero,
     );
 
-    off -%= @select(
-        u8,
-        v == @as(Vec, @splat(63)),
-        @as(Vec, @splat(12)),
-        zero,
-    );
-
-    return v +% off;
+    return v +% offset;
 }
 
-/// Builds the [lo, hi] byte-pair expansion mask.
+/// Encodes 24 input bytes starting at `i` into 32 Base64 bytes.
 ///
-/// Each input triple [a, b, c] becomes:
-///
-///     [a, a, b, a, c, b, c, c]
-///
-/// The resulting byte pairs are:
-///
-///     [a, a] [b, a] [c, b] [c, c]
-///
-/// The caller supplies lane_pos because the 32-byte path has a four-byte
-/// gap between its two overlapping loads, while the 16-byte path does not.
-fn makePairIdx(
-    comptime groups: usize,
-    comptime lane_pos: fn (usize) usize,
-) [groups * 8]i32 {
-    const orig = [_]u6{
-        0, 0, 1, 0,
-        2, 1, 2, 2,
-    };
+/// Uses little-endian pair bit-casts. Big-endian targets are rejected at
+/// compile time.
+inline fn encodeChunk(source: []const u8, i: usize) Chunk {
+    const a: Chunk16 = source[i..][0..16].*;
+    const b: Chunk16 = source[i + 8 ..][0..16].*;
 
-    var idx: [groups * 8]i32 = undefined;
-
-    for (0..groups) |g| {
-        for (0..8) |k| {
-            const source =
-                3 * g + @as(usize, orig[k]);
-
-            idx[8 * g + k] = @intCast(lane_pos(source));
-        }
-    }
-
-    return idx;
-}
-
-const pair_idx = makePairIdx(
-    8,
-    struct {
-        fn f(s: usize) usize {
-            // Source bytes 0..11 are in chunk positions 0..11.
-            // Source bytes 12..23 are in chunk positions 16..27.
-            return if (s < 12) s else s + 4;
-        }
-    }.f,
-);
-
-const pair_idx16 = makePairIdx(
-    4,
-    struct {
-        fn f(s: usize) usize {
-            return s;
-        }
-    }.f,
-);
-
-/// Builds a shuffle mask that packs bytes from two overlapping loads.
-///
-/// Positive indices select from the first shuffle operand.
-/// Bitwise-complemented indices select from the second operand.
-fn makeLoadIdx(
-    comptime output_width: usize,
-    comptime a_count: usize,
-    comptime b_output_offset: usize,
-    comptime b_source_offset: usize,
-    comptime b_count: usize,
-) [output_width]i32 {
-    var idx: [output_width]i32 = undefined;
-
-    // Padding is unused by the subsequent masks. Zero is a valid value.
-    for (0..output_width) |j| {
-        idx[j] = 0;
-    }
-
-    for (0..a_count) |j| {
-        idx[j] = @intCast(j);
-    }
-
-    for (0..b_count) |j| {
-        const source_index: i32 =
-            @intCast(b_source_offset + j);
-
-        idx[b_output_offset + j] = ~source_index;
-    }
-
-    return idx;
-}
-
-// a = source[i..i+16]
-// b = source[i+8..i+24]
-//
-// Result:
-//   chunk[0..12]  = source[0..12]
-//   chunk[16..28] = source[12..24]
-const load_idx = makeLoadIdx(
-    32,
-    12,
-    16,
-    4,
-    12,
-);
-
-// a = source[i..i+8]
-// b = source[i+4..i+12]
-//
-// Result:
-//   chunk[0..8] = source[0..8]
-//   chunk[8..12] = source[8..12]
-const load_idx16 = makeLoadIdx(
-    16,
-    8,
-    8,
-    4,
-    4,
-);
-
-fn makeShifts(
-    comptime lanes: usize,
-    comptime quad: [4]u4,
-) @Vector(lanes, u16) {
-    comptime {
-        if (lanes % 4 != 0) {
-            @compileError("makeShifts: lane count must be divisible by 4");
-        }
-    }
-
-    const Vec = @Vector(lanes, u16);
-    var result: Vec = undefined;
-
-    for (0..lanes / 4) |group| {
-        for (0..4) |lane| {
-            result[4 * group + lane] = @as(u16, quad[lane]);
-        }
-    }
-
-    return result;
-}
-
-const shifts = makeShifts(32, .{
-    10, 4, 6, 0,
-});
-
-const shifts16 = makeShifts(16, .{
-    2, 4, 6, 0,
-});
-
-inline fn encodeChunk(source: []const u8, i: usize) Vec32 {
-    comptime {
-        if (!little_endian_only) {
-            @compileError(
-                "encodeChunk: @bitCast(pair bytes -> u16) requires little-endian",
-            );
-        }
-    }
-
-    const a: Vec16 =
-        source[i..][0..16].*;
-
-    const b: Vec16 =
-        source[i + 8 ..][0..16].*;
-
-    const chunk: Vec32 =
-        @shuffle(u8, a, b, load_idx);
+    const chunk: Chunk = @shuffle(u8, a, b, load_indices_lanes);
 
     // Each pair is laid out as [lo, hi].
     // On little-endian targets, @bitCast interprets this as:
     //
     //     w = (hi << 8) | lo
-    //
-    const pairs: @Vector(64, u8) =
-        @shuffle(u8, chunk, undefined, pair_idx);
+    const pairs: @Vector(64, u8) = @shuffle(
+        u8,
+        chunk,
+        undefined,
+        pair_indices_8_groups,
+    );
+    const w: Pairs = @bitCast(pairs);
+    const v: Chunk = @truncate(
+        (w >> shifts_32_lanes) & @as(Pairs, @splat(0x3f)),
+    );
 
-    const w: Vec32u16 =
-        @bitCast(pairs);
-
-    const v: Vec32 =
-        @truncate(
-            (w >> shifts) &
-                @as(Vec32u16, @splat(0x3f)),
-        );
-
-    return translate(32, v);
+    return sextetsToAscii(32, v);
 }
 
-inline fn encodeChunk16(source: []const u8, i: usize) Vec16 {
-    comptime {
-        if (!little_endian_only) {
-            @compileError(
-                "encodeChunk16: @bitCast(pair bytes -> u16) requires little-endian",
-            );
-        }
-    }
+/// Encodes 12 input bytes starting at `i` into 16 Base64 bytes.
+///
+/// Uses little-endian pair bit-casts. Big-endian targets are rejected at
+/// compile time.
+inline fn encodeChunk16(source: []const u8, i: usize) Chunk16 {
+    const a: @Vector(8, u8) = source[i..][0..8].*;
+    const b: @Vector(8, u8) = source[i + 4 ..][0..8].*;
 
-    const a: @Vector(8, u8) =
-        source[i..][0..8].*;
+    const chunk: Chunk16 = @shuffle(u8, a, b, load_indices_16_lanes);
 
-    const b: @Vector(8, u8) =
-        source[i + 4 ..][0..8].*;
+    // `pair_idx16` produces [low_byte, high_byte] pairs.
+    // The second shuffle operand is unused, but must still be defined.
+    const zero: Chunk16 = @splat(0);
+    const pairs: @Vector(32, u8) = @shuffle(
+        u8,
+        chunk,
+        zero,
+        pair_indices_4_groups,
+    );
+    const w: Pairs16 = @bitCast(pairs);
+    const v: Chunk16 = @truncate(
+        (w >> shifts_16_lanes) & @as(Pairs16, @splat(0x3f)),
+    );
 
-    const chunk: Vec16 =
-        @shuffle(u8, a, b, load_idx16);
-
-    // pair_idx16 only references positions 0..11, so the second
-    // shuffle operand is not logically used. Keep it defined anyway.
-    const zero: Vec16 = @splat(0);
-
-    const pairs: @Vector(32, u8) =
-        @shuffle(u8, chunk, zero, pair_idx16);
-
-    const w: Vec16u16 =
-        @bitCast(pairs);
-
-    const v: Vec16 =
-        @truncate(
-            (w >> shifts16) &
-                @as(Vec16u16, @splat(0x3f)),
-        );
-
-    return translate(16, v);
+    return sextetsToAscii(16, v);
 }
 
 /// Returns the padded Base64 output size.
+///
+/// `source_len` must be small enough for the padded output to fit in `usize`.
 pub fn computeSize(source_len: usize) usize {
     const groups = source_len / 3 + @intFromBool(source_len % 3 != 0);
-    return groups * 4; // cannot overflow: groups <= ceil(maxInt/3)
+    return groups * 4;
 }
 
-/// Returns the exact decoded size for padded Base64 slice.
+test "computeSize: does not overflow for representable outputs" {
+    const max_len = (std.math.maxInt(usize) / 4) * 3;
+    _ = computeSize(max_len);
+}
+
+/// Returns the exact decoded size for a padded Base64 slice.
 ///
-/// This validates:
-/// - length is a multiple of four;
-/// - padding is at the end;
-/// - there are at most two padding characters.
+/// Returns `error.InvalidPadding` if:
+/// - the length is not a multiple of four;
+/// - padding is not at the end; or
+/// - more than two padding characters are present.
 ///
-/// It does not validate the Base64 alphabet itself.
+/// NOTE The base64 alphabet is not validated.
 pub fn computeSizeForSlice(source: []const u8) !usize {
     const len = source.len;
-    if (len % 4 != 0) return error.InvalidPadding;
-    if (len == 0) return 0;
+
+    if (len % 4 != 0) {
+        return error.InvalidPadding;
+    }
+
+    if (len == 0) {
+        return 0;
+    }
 
     var padding: usize = 0;
     if (source[len - 1] == '=') {
@@ -338,18 +250,9 @@ pub fn computeSizeForSlice(source: []const u8) !usize {
         padding += 1;
     }
 
-    if (padding > 2) return error.InvalidPadding;
-
-    // Padding is only allowed in the final padding positions.
+    // Any '=' before the final padding positions is invalid.
     const non_padding_len = len - padding;
-    for (source[0..non_padding_len]) |byte| {
-        if (byte == '=') {
-            return error.InvalidPadding;
-        }
-    }
-
-    // A single padding byte must be the final byte only.
-    if (padding == 1 and source[len - 2] == '=') {
+    if (std.mem.findScalar(u8, source[0..non_padding_len], '=') != null) {
         return error.InvalidPadding;
     }
 
@@ -363,18 +266,18 @@ pub fn computeSizeForSlice(source: []const u8) !usize {
 
 /// A Base64 encoder that supports both buffer-based and allocating encoding.
 pub const Encoder = struct {
-    /// Encodes `source` into the caller-provided buffer `dest`, returning
-    /// the number of bytes written.
+    /// Encodes `source` into `dest` and returns the number of bytes written.
     ///
-    /// `dest` must be at least `computeSize(source.len)` bytes long, otherwise
-    /// `error.NoSpaceLeft` is returned. Use `computeSize` to compute the
-    /// required length ahead of time. `dest` may be larger than required;
-    /// callers may reuse an oversized scratch buffer across calls.
+    /// The `dest` must be at least `computeSize(source.len)` bytes long.
+    /// The required size can be computed with `computeSize` before calling.
     ///
-    /// Encodes source into dest and returns the number of bytes written.
+    /// Passing a smaller destinatin is a programming error and triggers an
+    /// assertion failure in safety-enabled builds. The `dest` maby be larger
+    /// than required and can be reused as an oversized scratch buffer.
     pub fn encodeToSlice(dest: []u8, source: []const u8) usize {
         const dest_size = computeSize(source.len);
         std.debug.assert(dest.len >= dest_size);
+
         const source_len = source.len;
         if (source_len == 0) {
             return 0;
@@ -383,10 +286,8 @@ pub const Encoder = struct {
         var source_index: usize = 0;
         var dest_index: usize = 0;
 
-        // Fast scalar path for inputs too short for the vector loop;
-        // skips hoisting the ymm constants entirely.
-        if (source_len >= 24) {
-            @branchHint(.likely);
+        // ymm main loop: 24 bytes -> 32 chars.
+        if (tier == .avx2 and source_len >= 24) {
             while (source_index + 24 <= source_len) : ({
                 source_index += 24;
                 dest_index += 32;
@@ -395,33 +296,58 @@ pub const Encoder = struct {
             }
         }
 
-        // 12 bytes -> 16 chars, half-width version of encodeChunk.
-        // No lane crossing at all: a single 16-byte shuffle does the
-        // whole pair expansion.
-        // if (source_len - source_index >= 12) {
-        //     const c: Vec16 = source[source_index..][0..16].*; // reads 16, uses 12
-        //     // pair_idx16: for g in 0..4, emit [3g, 3g, 3g+1, 3g, 3g+1,
-        //     //            3g+2, 3g+2, 3g+2] — same orig table, 4 groups
-        //     const pairs: @Vector(32, u8) = @shuffle(u8, c, undefined, pair_idx16);
-        //     const w: @Vector(16, u16) = @bitCast(pairs);
-        //     const v: Vec16 = @truncate((w >> shifts16) & @as(@Vector(16, u16), @splat(0x3f)));
-        //
-        //     // same compare/select ladder as encodeChunk, at Vec16 width
-        //     dest[dest_index..][0..16].* = v +% off16;
-        //     source_index += 12;
-        //     dest_index += 16;
-        // }
-
-        // xmm half-chunk: 12 bytes -> 16 chars for the 12..23 byte band.
+        // xmm half-chunk: 12 bytes => 16 chars for the 12..23 byte band.
         // Runs at most once (remaining < 24 here); the @Vector(16) ops
         // stay in xmm registers with no lane-crossing at all.
-        if (source_index + 12 <= source_len) {
-            dest[dest_index..][0..16].* = encodeChunk16(source, source_index);
-            source_index += 12;
-            dest_index += 16;
+        if (tier != .scalar and source_index + 12 <= source_len) {
+            while (source_index + 12 <= source_len) : ({
+                source_index += 12;
+                dest_index += 16;
+            }) {
+                dest[dest_index..][0..16].* = encodeChunk16(source, source_index);
+            }
+        } else {
+            // Scalar bulk path: 12 bytes -> 16 chars via one u128 load
+            // split into independent u64/u32 shift chains feeding the
+            // 12-bit pair LUT. Reads 16 bytes, uses 12.
+            while (source_index + 15 < source_len) : ({
+                source_index += 12;
+                dest_index += 16;
+            }) {
+                const bits = std.mem.readInt(
+                    u128,
+                    source[source_index..][0..16],
+                    .big,
+                );
+
+                // Big-endian read: source bytes 0..11 occupy bits 127..32;
+                // bytes 12..15 in the low 32 bits are discarded.
+                const hi: u64 = @truncate(bits >> 64); // source bytes 0..7
+                const mid: u32 = @truncate(bits >> 32); // source bytes 8..11
+
+                // hi chain: 5 pairs + 4 leftover bits
+                writeScalarPair(dest, dest_index + 0, @truncate(hi >> 52));
+                writeScalarPair(dest, dest_index + 2, @truncate(hi >> 40));
+                writeScalarPair(dest, dest_index + 4, @truncate(hi >> 28));
+                writeScalarPair(dest, dest_index + 6, @truncate(hi >> 16));
+                writeScalarPair(dest, dest_index + 8, @truncate(hi >> 4));
+
+                // boundary pair: hi bits 3..0 ++ mid bits 31..24
+                writeScalarPair(
+                    dest,
+                    dest_index + 10,
+                    @truncate((@as(u64, hi & 0xf) << 8) | (mid >> 24)),
+                );
+
+                // mid chain: bytes 9..11
+                writeScalarPair(dest, dest_index + 12, @truncate(mid >> 12));
+                writeScalarPair(dest, dest_index + 14, @truncate(mid));
+            }
         }
 
-        // Process exactly 3 source bytes as 4 Base64 characters
+        // Remaining full triples (0..3 at every tier; arbitrary run only
+        // if the u128 loop couldn't start, i.e. len < 15 handled below too:
+        // this loop also covers whatever the block loops left behind).
         while (source_index + 3 <= source_len) : ({
             source_index += 3;
             dest_index += 4;
@@ -446,7 +372,6 @@ pub const Encoder = struct {
 
         // Encode the remaining zero, one, or two bytes.
         const remaining = source_len - source_index;
-
         switch (remaining) {
             0 => {},
 
@@ -487,9 +412,11 @@ pub const Encoder = struct {
         return dest_size;
     }
 
-    /// Encodes `source` into a newly allocated buffer using `allocator`.
+    /// Encodes `source` into a newly allocated buffer.
     ///
-    /// The caller owns the returned slice and is responsible for freeing it.
+    /// The caller owns the returned slice and must free it with `gpa`.
+    ///
+    /// Returns an allocator error if the output buffer cannot be allocated.
     pub fn encode(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
         const out = try gpa.alloc(u8, computeSize(source.len));
         _ = encodeToSlice(out, source);
