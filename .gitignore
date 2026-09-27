@@ -2,6 +2,8 @@
 .zig-cache/
 zig-out/
 *.o
+*.data
+**/testdata/**/*.bin
 zig-pkg/
 build/
 build-*/
