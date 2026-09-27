@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = @import("src/simd.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -20,6 +21,20 @@ pub fn build(b: *std.Build) void {
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
+
+    switch (simd.Tier.fromCpu(target.result.cpu)) {
+        .avx2 => {},
+
+        .simd128 => std.log.info(
+            "base64 encoder selected the 128-bit SIMD tier\n",
+            .{},
+        ),
+
+        .scalar => std.log.warn(
+            "base64 encoder selected the scalar tier; no supported SIMD features were found\n",
+            .{},
+        ),
+    }
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -114,6 +129,48 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            // b.createModule defines a new module just like b.addModule but,
+            // unlike b.addModule, it does not expose the module to consumers of
+            // this package, which is why in this case we don't have to give it a name.
+            .root_source_file = b.path("src/bench.zig"),
+            // Target and optimization levels must be explicitly wired in when
+            // defining an executable or library (in the root module), and you
+            // can also hardcode a specific target for an executable or library
+            // definition if desireable (e.g. firmware for embedded devices).
+            .target = target,
+            .optimize = optimize,
+            // List of modules available for import in source files part of the
+            // root module.
+            .imports = &.{
+                // Here "base64" is the name you will use in your source code to
+                // import this module (e.g. `@import("base64")`). The name is
+                // repeated because you are allowed to rename your imports, which
+                // can be extremely useful in case of collisions (which can happen
+                // importing modules from different packages).
+                .{ .name = "base64", .module = mod },
+            },
+        }),
+    });
+
+    const include_large = b.option(
+        bool,
+        "large",
+        "Embed large (>=4 MiB) benchmark testdata",
+    ) orelse false;
+
+    const bench_option = b.addOptions();
+    bench_option.addOption(bool, "include_large", include_large);
+
+    bench.root_module.addOptions("build_options", bench_option);
+
+    const install_bench = b.addInstallArtifact(bench, .{});
+
+    const bench_step = b.step("bench", "Run the benchmark");
+    bench_step.dependOn(&install_bench.step);
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
