@@ -2,11 +2,10 @@
 set -euo pipefail
 
 CPU="${CPU:-3}"
-BIN="${BIN:-./zig-out/bin/base64}"
+BIN="${BIN:-./zig-out/bin/bench}"
 RUNS="${RUNS:-10}"
 OUT_DIR="${OUT_DIR:-perf-results}"
 
-# zig build -Doptimize=ReleaseFast -Dlarge=true --summary all
 
 mkdir -p "$OUT_DIR"
 
