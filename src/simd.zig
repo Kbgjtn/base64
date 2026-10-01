@@ -2,6 +2,9 @@ const std = @import("std");
 
 pub const u8x16 = @Vector(16, u8);
 pub const u8x32 = @Vector(32, u8);
+pub const u8x64 = @Vector(64, u8);
+
+pub const u6x32 = @Vector(32, u6);
 
 pub const u16x8 = @Vector(8, u16);
 pub const u16x16 = @Vector(16, u16);
