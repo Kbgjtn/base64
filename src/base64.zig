@@ -482,3 +482,204 @@ pub const standard = Codecs(standard_alphabet_chars, '=');
 pub const standard_no_pad = Codecs(standard_alphabet_chars, null);
 pub const url_safe = Codecs(url_safe_alphabet_chars, '=');
 pub const url_safe_no_pad = Codecs(url_safe_alphabet_chars, null);
+
+const testing = std.testing;
+
+fn testEncode(comptime Codec: type, src: []const u8, expected: []const u8) !void {
+
+    // encode to slice
+    {
+        const out_len = Codec.Encoder.calcSize(src.len);
+        try std.testing.expectEqual(expected.len, out_len);
+
+        var buf: [256]u8 = undefined;
+        const n = Codec.Encoder.encodeToSlice(buf[0..out_len], src);
+        try testing.expectEqualStrings(expected, buf[0..n]);
+    }
+
+    // encode with alloc
+    {
+        const buf = try Codec.Encoder.allocEncode(testing.allocator, src);
+        defer testing.allocator.free(buf);
+        try testing.expectEqualStrings(expected, buf);
+    }
+
+    // encode to stream writer
+    {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try Codec.Encoder.encodeWriter(&aw.writer, src);
+        try testing.expectEqualStrings(expected, aw.written());
+    }
+}
+
+test "Base64Encoder: fixed vectors, standard" {
+    try testEncode(standard, "", "");
+    try testEncode(standard, "f", "Zg==");
+    try testEncode(standard, "fo", "Zm8=");
+    try testEncode(standard, "foo", "Zm9v");
+    try testEncode(standard, "foob", "Zm9vYg==");
+    try testEncode(standard, "fooba", "Zm9vYmE=");
+    try testEncode(standard, "foobar", "Zm9vYmFy");
+
+    try testEncode(standard, "\xff\xff\xff", "////");
+    try testEncode(standard, "\xfb\xff\xbf", "+/+/");
+
+    try testEncode(standard, "\x00\x10\x83\x10\x51\x87\x20\x92\x8b", "ABCDEFGHIJKL");
+}
+
+test "Base64Encoder: fixed vectors, standard_no_pad" {
+    try testEncode(standard_no_pad, "", "");
+    try testEncode(standard_no_pad, "f", "Zg");
+    try testEncode(standard_no_pad, "fo", "Zm8");
+    try testEncode(standard_no_pad, "foo", "Zm9v");
+    try testEncode(standard_no_pad, "foob", "Zm9vYg");
+    try testEncode(standard_no_pad, "fooba", "Zm9vYmE");
+    try testEncode(standard_no_pad, "foobar", "Zm9vYmFy");
+}
+
+test "Base64Encoder: fixed vectors, url_safe" {
+    try testEncode(url_safe, "", "");
+    try testEncode(url_safe, "f", "Zg==");
+    try testEncode(url_safe, "fo", "Zm8=");
+    try testEncode(url_safe, "foo", "Zm9v");
+    try testEncode(url_safe, "foob", "Zm9vYg==");
+    try testEncode(url_safe, "fooba", "Zm9vYmE=");
+    try testEncode(url_safe, "foobar", "Zm9vYmFy");
+    try testEncode(url_safe, "\xfb\xff\xbf", "-_-_");
+    try testEncode(url_safe, "\xff\xff\xff", "____");
+}
+
+test "Base64Encoder: fixed vectors, url_safe_no_pad" {
+    try testEncode(url_safe_no_pad, "", "");
+    try testEncode(url_safe_no_pad, "f", "Zg");
+    try testEncode(url_safe_no_pad, "fo", "Zm8");
+    try testEncode(url_safe_no_pad, "foo", "Zm9v");
+    try testEncode(url_safe_no_pad, "foob", "Zm9vYg");
+    try testEncode(url_safe_no_pad, "fooba", "Zm9vYmE");
+    try testEncode(url_safe_no_pad, "foobar", "Zm9vYmFy");
+}
+
+test "Base64Encoder: differential vs std.base64, all codecs" {
+    const Pair = struct { custom: type, std: std.base64.Codecs };
+    const pairs = [_]Pair{
+        .{ .custom = standard, .std = std.base64.standard },
+        .{ .custom = standard_no_pad, .std = std.base64.standard_no_pad },
+        .{ .custom = url_safe, .std = std.base64.url_safe },
+        .{ .custom = url_safe_no_pad, .std = std.base64.url_safe_no_pad },
+    };
+
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const rnd = prng.random();
+
+    inline for (pairs) |p| {
+        for (0..1024) |len| {
+            var src: [1024]u8 = undefined;
+            rnd.bytes(src[0..len]);
+
+            var got: [2048]u8 = undefined;
+            var want: [2048]u8 = undefined;
+
+            const n = p.custom.Encoder.encodeToSlice(&got, src[0..len]);
+            const wn = p.std.Encoder.encode(&want, src[0..len]).len;
+
+            try testing.expectEqual(wn, n);
+            try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+        }
+    }
+}
+
+test "Base64Encoder: sextet 62/63 boundary coverage" {
+    // All sextets = 63 — the old `source > 63` ladder bug (always false,
+    // since masked input never exceeds 63) lived exactly here.
+    try testEncode(standard, "\xff\xff\xff", "////");
+    try testEncode(url_safe, "\xff\xff\xff", "____");
+
+    // Alternating 62/63 within one 4-sextet group; catches an off-by-one
+    // between the adjacent top-of-range branches that an all-63 vector
+    // can't distinguish.
+    try testEncode(standard, "\xfb\xff\xbf", "+/+/");
+    try testEncode(url_safe, "\xfb\xff\xbf", "-_-_");
+
+    // All sextets = 0 and = 26/52 pin the other alphabet-offset boundaries
+    // (upper/lower/digit transitions in the offset ladder).
+    try testEncode(standard, "\x00\x00\x00", "AAAA");
+
+    // the standard alphabet (0-25 = A-Z, 26-51 = a-z, 52-61 = digits, 62 = +, 63 = /):
+    // 0x68 0x1a 0x69 = 01101000 00011010 01101001
+    try testEncode(standard, "\x68\x1a\x69", "aBpp");
+}
+
+test "Base64Encoder: calcSize matches std for both pad modes" {
+    for (0..128) |len| {
+        try testing.expectEqual(
+            std.base64.standard.Encoder.calcSize(len),
+            standard.Encoder.calcSize(len),
+        );
+        try testing.expectEqual(
+            std.base64.standard_no_pad.Encoder.calcSize(len),
+            standard_no_pad.Encoder.calcSize(len),
+        );
+    }
+}
+
+test "Base64Encoder: chunk and tier boundary lengths" {
+    // Exercise every transition point across the avx2/simd128/scalar tiers:
+    // 23/24/25 (ymm chunk boundary), 11/12/13 (xmm chunk boundary),
+    // 14/15/16/17 (scalar u128 lookahead boundary), 0/1/2/3 (tail switch).
+    const lens = [_]usize{
+        0,  1,  2,  3,  4,  5,
+        11, 12, 13, 14, 15, 16,
+        17, 23, 24, 25, 47, 48,
+        49,
+    };
+
+    var prng = std.Random.DefaultPrng.init(1);
+    const rnd = prng.random();
+    for (lens) |len| {
+        var src: [64]u8 = undefined;
+        rnd.bytes(src[0..len]);
+        var got: [128]u8 = undefined;
+        var want: [128]u8 = undefined;
+        const n = standard.Encoder.encodeToSlice(&got, src[0..len]);
+        const wn = std.base64.standard.Encoder.encode(&want, src[0..len]).len;
+        try testing.expectEqual(wn, n);
+        try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+    }
+}
+
+test "Base64Encoder: encodeWriter matches encodeToSlice across small/chunk/multi-chunk" {
+    var prng = std.Random.DefaultPrng.init(2);
+    const rnd = prng.random();
+    // 0, small_in_len-ish, exactly stream_in_len, stream_in_len+1,
+    // several multiples of stream_in_len.
+    const lens = [_]usize{ 0, 1, 4095, 4096, 4097, 12288, 12289, 24576, 24577 };
+    inline for (lens) |len| {
+        const src = try testing.allocator.alloc(u8, len);
+        defer testing.allocator.free(src);
+        rnd.bytes(src);
+
+        const computeSize_placeholder = comptime standard.Encoder.calcSize(len);
+        var direct_buf: [computeSize_placeholder]u8 = undefined; // size via calcSize(len)
+        const dn = standard.Encoder.encodeToSlice(direct_buf[0..standard.Encoder.calcSize(len)], src);
+
+        var aw = std.Io.Writer.Allocating.init(testing.allocator);
+        defer aw.deinit();
+        try standard.Encoder.encodeWriter(&aw.writer, src);
+
+        try testing.expectEqualSlices(u8, direct_buf[0..dn], aw.written());
+    }
+}
+
+test "Base64Encoder: padding, oversized dest buffer unaffected beyond written length" {
+    const input = "foo";
+    var expect: [128]u8 = undefined;
+    @memset(&expect, 0);
+    _ = url_safe.Encoder.encodeToSlice(expect[0..url_safe.Encoder.calcSize(input.len)], input);
+
+    var got: [128]u8 = undefined;
+    @memset(&got, 0);
+    _ = url_safe.Encoder.encodeToSlice(&got, input); // full 128-byte dest, not just calcSize
+
+    try testing.expectEqualSlices(u8, &expect, &got);
+}
