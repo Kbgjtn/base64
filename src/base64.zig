@@ -560,7 +560,7 @@ test "Base64Encoder: fixed vectors, url_safe_no_pad" {
     try testEncode(url_safe_no_pad, "foobar", "Zm9vYmFy");
 }
 
-test "Base64Encoder: differential vs std.base64, all codecs" {
+test "Base64Encoder: compare to std.base64, all codecs" {
     const Pair = struct { custom: type, std: std.base64.Codecs };
     const pairs = [_]Pair{
         .{ .custom = standard, .std = std.base64.standard },
