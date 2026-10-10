@@ -10,6 +10,7 @@
 //!
 //! When the input length isn't a multiple of 3 bytes, the output is padded
 //! with `=` so that the encoded length is always a multiple of 4:
+//!
 //!   * 1 leftover byte  = 2 chars + "=="
 //!   * 2 leftover bytes = 3 chars + "="
 //!
@@ -19,7 +20,6 @@
 //! six-bit characters.
 
 const std = @import("std");
-pub const std_options: std.Options = .{ .log_level = .debug };
 const builtin = @import("builtin");
 
 const native_endian = builtin.target.cpu.arch.endian();
@@ -75,18 +75,35 @@ comptime {
     if (stream_in_len % 24 != 0) @compileError("stream_in_len must be a multiple of 24");
 }
 
-/// Expands 24 souce bytes into 32 sextets packed as byte pairs, one 12-byte group.
-/// pair_indicies_24[i] selects which source byte lands in each output byte lane.
+/// Expands the 32-lane `chunk` (24 source bytes, 8 groups of 3) into
+/// [low, high] sextet-byte pairs for encodeChunk()'s u16 bitcast.
 const pair_indices_8_groups = simd.expandTriplePairs(8);
+
+/// Expands the 16-lane `chunk` (12 source bytes, 4 groups of 3) into
+/// [low, high] sextet-byte pairs for encodeChunk16()'s u16 bitcast.
 const pair_indices_4_groups = simd.expandTriplePairs(4);
 
+/// Per-lane shift amounts for extracting 4 sextets from 2 packed `u16` pairs
+/// (8 source-bytes => 4 base64 characters), repeated across all 8 groups of a
+/// 32-lane chunk. Each `u16` lane holds [lo=byte0, hi=byte1] of a pair;
+/// See `pair_indices_8_groups` for how `encodeChunk` builds those pairs.
+///
+/// Shift set `.{10, 4, 6, 0}` pulls out, in output order:
+/// 10 = top 6 bits o byte0 (sextet 0)
+/// 4  = low 2 bits o byte0 + top 4 bits of byte1 (sextet 1, via 16-bit lane straddling both bytes)
+/// 6  = mid 6 bits spanning byte1/byte2 boundary (sextet 2)
+/// 0  = low 6 bits of the high byte (sextet 3)
 const shifts_32_lanes = simd.laneShifts(32, .{ 10, 4, 6, 0 });
+
+/// Same shift pattern as `shifts_32_lanes`, tiled across 4 groups instead
+/// of 8 — used by `encodeChunk16` for the 12-byte/16-char remainder chunk.
 const shifts_16_lanes = simd.laneShifts(16, .{ 10, 4, 6, 0 });
 
 // Combines two overlapping 16-byte loads into a 32-byte chunk.
 //
 // A contributes source[i .. i+12] at chunk[0 .. 12].
 // B contributes source[i+12 .. i+24] at chunk[16 .. 28].
+//
 // The remaining lanes are padding.
 const load_indices_32_lanes = simd.loadIndices(
     32,
@@ -98,6 +115,7 @@ const load_indices_32_lanes = simd.loadIndices(
 //
 // A contributes source[i .. i+8] at chunk[0 .. 8].
 // B contributes source[i+8 .. i+12] at chunk[8 .. 12].
+//
 // The remaining lanes are padding.
 const load_indices_16_lanes = simd.loadIndices(
     16,
@@ -110,7 +128,7 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
         const Self = @This();
 
         const alphabet = alphabet_chars;
-        const small_out_len: usize = calcSize(.{}, small_in_len);
+        const small_out_len: usize = calcSize(&.{}, small_in_len);
 
         pub const stream_out_len: usize = blk: {
             // stream chunks always take the padded size of stream_in_len; since
@@ -135,12 +153,9 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
             break :blk t;
         };
 
-        /// Alphabet  as a vector for @shuffle.
-        const alphabet_vec: simd.u8x64 = alphabet;
-
         /// Translates 6-bit sextet to ASCII via the offset ladder.
         ///
-        /// Callie must ensure `source` already be masked to 6 bits.
+        /// Caller must ensure `source` is already masked to 6 bits.
         inline fn sextetsToAscii(comptime size: usize, source: @Vector(size, u8)) @Vector(size, u8) {
             const Vec = @Vector(size, u8);
 
@@ -245,7 +260,7 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
         }
 
         /// Returns the padded Base64 output size.
-        pub fn calcSize(_: Self, source_len: usize) usize {
+        pub fn calcSize(_: *const Self, source_len: usize) usize {
             if (comptime pad_char != null) {
                 return @divTrunc(source_len + 2, 3) * 4;
             } else {
