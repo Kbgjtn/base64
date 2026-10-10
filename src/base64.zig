@@ -110,8 +110,8 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
         const Self = @This();
 
         const alphabet = alphabet_chars;
+        const small_out_len: usize = calcSize(.{}, small_in_len);
 
-        const small_out_len: usize = @divTrunc(small_in_len + 2, 3) * 4;
         pub const stream_out_len: usize = blk: {
             // stream chunks always take the padded size of stream_in_len; since
             // stream_in_len % 3 == 0 the padded and unpadded sizes agree except
