@@ -454,6 +454,258 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
     };
 }
 
+const invalid_char: u8 = 0xff;
+const invalid_char_tst: u32 = 0xff00_0000;
+
+pub const Error = error{
+    InvalidCharacter,
+    InvalidPadding,
+    NoSpaceLeft,
+};
+
+pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
+    return struct {
+        const Self = @This();
+
+        // Built once per (alphabet, pad_char) instantiation, no init() call,
+        // no runtime struct fields. Mirrors Base64Decoder.init's two tables.
+        const char_to_index: [256]u8 = blk: {
+            var t: [256]u8 = .{invalid_char} ** 256;
+
+            for (alphabet_chars, 0..) |char, index| {
+                if (t[char] != invalid_char) {
+                    @compileError("decoder: duplicate alphabet character.");
+                }
+                if (pad_char != null and char == pad_char.?) {
+                    @compileError("decoder: alphabet character with pad_char");
+                }
+                t[char] = @intCast(index);
+            }
+
+            break :blk t;
+        };
+
+        const fast_char_to_index: [4][256]u32 = blk: {
+            var t = [_][256]u32{[_]u32{invalid_char_tst} ** 256} ** 4;
+            for (alphabet_chars, 0..) |char, index| {
+                const char_idx: u32 = @intCast(index);
+                t[0][char] = char_idx << 2;
+                t[1][char] = (char_idx >> 4) | ((char_idx & 0x0f) << 12);
+                t[2][char] = ((char_idx & 0x3) << 22) | ((char_idx & 0x3c) << 6);
+                t[3][char] = char_idx << 16;
+            }
+            break :blk t;
+        };
+
+        /// Upper bound on decoded length; exact only when there's no padding
+        /// to subtract. `InvalidPadding` if source_len's shape is impossible.
+        pub fn calcSizeUpperBound(_: *const Self, source_len: usize) Error!usize {
+            var result = source_len / 4 * 3;
+            const leftover = source_len % 4;
+            if (comptime pad_char != null) {
+                if (leftover != 0) return error.InvalidPadding;
+            } else {
+                if (leftover == 1) return error.InvalidPadding;
+                result += leftover * 3 / 4;
+            }
+
+            return result;
+        }
+
+        /// Exact decoded length for a specific source slice (accounts for trailing pad chars
+        /// actually present).
+        pub fn calcSizeForSlice(self: *const Self, source: []const u8) Error!usize {
+            const source_len = source.len;
+            var result = try self.calcSizeUpperBound(source_len);
+            if (comptime pad_char) |p| {
+                if (source_len >= 1 and source[source_len - 1] == p) result -= 1;
+                if (source_len >= 2 and source[source_len - 2] == p) result -= 1;
+            }
+            return result;
+        }
+
+        /// Destination length must be exactly as per calcSizeForSlice(source).
+        pub fn decode(_: *const Self, dest: []u8, source: []const u8) Error!void {
+            if (pad_char != null and source.len % 4 != 0) return error.InvalidPadding;
+
+            var dest_idx: usize = 0;
+            var fast_src_idx: usize = 0;
+            var acc: u12 = 0;
+            var acc_len: u4 = 0;
+            var leftover_idx: ?usize = null;
+
+            // 16-byte fast loop: 4 lanes of fast_char_to_index OR'd together,
+            // one u128 little-endian store per 16 source chars, 12 dest bytes.
+            while (fast_src_idx + 16 < source.len and dest_idx + 15 < dest.len) : ({
+                fast_src_idx += 16;
+                dest_idx += 12;
+            }) {
+                var bits: u128 = 0;
+                var any_invalid: u32 = 0;
+
+                inline for (0..4) |i| {
+                    var new_bits: u128 = fast_char_to_index[0][source[fast_src_idx + i * 4]];
+                    new_bits |= fast_char_to_index[1][source[fast_src_idx + 1 + i * 4]];
+                    new_bits |= fast_char_to_index[2][source[fast_src_idx + 2 + i * 4]];
+                    new_bits |= fast_char_to_index[3][source[fast_src_idx + 3 + i * 4]];
+
+                    // Accumulate the sentinel check here, pre-shift, where all four lanes
+                    // sentinel bits stil occupy the same [24,31] range, this is collision-free,
+                    // unilike check bits after the shift bellow.
+                    any_invalid |= @truncate(new_bits & invalid_char_tst);
+                    bits |= (new_bits << (24 * i));
+                }
+
+                if (any_invalid != 0) return error.InvalidCharacter;
+                std.mem.writeInt(u128, dest[dest_idx..][0..16], bits, .little);
+            }
+
+            // 4-byte loop: same table trick, one lane group at a time
+            while (fast_src_idx + 4 < source.len and dest_idx + 3 < dest.len) : ({
+                fast_src_idx += 4;
+                dest_idx += 3;
+            }) {
+                var bits = fast_char_to_index[0][source[fast_src_idx]];
+
+                bits |= fast_char_to_index[1][source[fast_src_idx + 1]];
+                bits |= fast_char_to_index[2][source[fast_src_idx + 2]];
+                bits |= fast_char_to_index[3][source[fast_src_idx + 3]];
+                if ((bits & invalid_char_tst) != 0) return error.InvalidCharacter;
+                std.mem.writeInt(u32, dest[dest_idx..][0..4], bits, .little);
+            }
+
+            // Scalar tail: bit accumulator, 6 bits in / 8 bits out.
+            const remaining = source[fast_src_idx..];
+            for (remaining, fast_src_idx..) |c, src_idx| {
+                const d = char_to_index[c];
+                if (d == invalid_char) {
+                    if (pad_char == null or c != pad_char.?) return error.InvalidCharacter;
+                    leftover_idx = src_idx;
+                    break;
+                }
+                acc = (acc << 6) + d;
+                acc_len += 6;
+                if (acc_len >= 8) {
+                    acc_len -= 8;
+                    dest[dest_idx] = @truncate(acc >> acc_len);
+                    dest_idx += 1;
+                }
+            }
+
+            if (acc_len > 4 or (acc & (@as(u12, 1) << acc_len) - 1) != 0) {
+                return error.InvalidPadding;
+            }
+
+            if (leftover_idx == null) return;
+            const leftover = source[leftover_idx.?..];
+            if (comptime pad_char) |p| {
+                const padding_len = acc_len / 2;
+                var padding_chars: usize = 0;
+                for (leftover) |c| {
+                    if (c != p) {
+                        // compares the raw byte against the sentinel value directly
+                        return if (c == invalid_char) error.InvalidCharacter else error.InvalidPadding;
+                    }
+                    padding_chars += 1;
+                }
+
+                if (padding_chars != padding_len) return error.InvalidPadding;
+            }
+        }
+    };
+}
+
+pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
+    const Decoder = DecoderImpl(alphabet_chars, pad_char);
+
+    return struct {
+        const Self = @This();
+
+        const char_to_index = Decoder.char_to_index;
+
+        // char_is_ignored is a runtime known, ignore_chars is caller-supplied per call,
+        char_is_ignored: [256]bool,
+
+        pub fn init(ignore_chars: []const u8) Self {
+            var self: Self = .{ .char_is_ignored = [_]bool{false} ** 256 };
+
+            for (ignore_chars) |c| {
+                std.debug.assert(char_to_index[c] == invalid_char);
+                std.debug.assert(!self.char_is_ignored[c]);
+                std.debug.assert(pad_char == null or pad_char.? != c);
+
+                self.char_is_ignored[c] = true;
+            }
+
+            return self;
+        }
+
+        /// Maximum possible decoded size, actual lenght may be less if the input
+        /// includes padding or ignored characters.
+        pub fn calcSizeUpperBound(_: *const Self, source_len: usize) usize {
+            var size = source_len / 4 * 3;
+            if (comptime pad_char == null) {
+                const leftover = source_len % 4;
+                size += leftover * 3 / 4;
+            }
+            return size;
+        }
+
+        pub fn decode(self: *const Self, dest: []u8, source: []const u8) Error!usize {
+            var acc: u12 = 0;
+            var acc_len: u4 = 0;
+            var dest_idx: usize = 0;
+            var leftover_idx: ?usize = null;
+
+            for (source, 0..) |c, src_idx| {
+                if (self.char_is_ignored[c]) continue;
+
+                const d = char_to_index[c];
+                if (d == invalid_char) {
+                    if (pad_char == null or c != pad_char.?) return error.InvalidCharacter;
+                    leftover_idx = src_idx;
+                    break;
+                }
+
+                acc = (acc << 6) + d;
+                acc_len += 6;
+                if (acc_len >= 8) {
+                    if (dest_idx == dest.len) return error.NoSpaceLeft;
+                    acc_len -= 8;
+                    dest[dest_idx] = @truncate(acc >> acc_len);
+                    dest_idx += 1;
+                }
+            }
+
+            if (acc_len > 4 or (acc & (@as(u12, 1) << acc_len) - 1) != 0) {
+                return error.InvalidPadding;
+            }
+
+            const padding_len = acc_len / 2;
+            if (leftover_idx == null) {
+                if (pad_char != null and padding_len != 0) return error.InvalidPadding;
+                return dest_idx;
+            }
+
+            const leftover = source[leftover_idx.?..];
+            if (comptime pad_char) |p| {
+                var padding_chars: usize = 0;
+
+                for (leftover) |c| {
+                    if (self.char_is_ignored[c]) continue;
+                    if (c != p) {
+                        return if (c == invalid_char) error.InvalidCharacter else error.InvalidPadding;
+                    }
+                    padding_chars += 1;
+                }
+                if (padding_chars != padding_len) return error.InvalidPadding;
+            }
+
+            return dest_idx;
+        }
+    };
+}
+
 /// One Base64 variant: alphabet + padding + a specialized encoder.
 /// Mirrors std.base64.Codecs, minus the decoder side for now.
 pub fn Codecs(comptime alphabet: [64]u8, comptime pad: ?u8) type {
@@ -466,7 +718,16 @@ pub fn Codecs(comptime alphabet: [64]u8, comptime pad: ?u8) type {
         /// `standard.Encoder.encode(dest, src)`.
         pub const Encoder: EncoderImpl(alphabet, pad) = .{};
 
-        pub const Decoder: type = void;
+        pub const Decoder: DecoderImpl(alphabet, pad) = .{};
+
+        /// Returns a decoder that additionally skips `ignore_chars` (e.g. "\r\n"
+        /// for PEM-wrapped input) instead of treating them as InvalidCharacter.
+        ///
+        /// `ignore_chars` is a runtime value, so `char_is_ignored` is built at
+        /// call time, not comptime, same cost shape as std's `init`.
+        pub fn decoderWithIgnore(ignore_chars: []const u8) DecoderWithIgnoreImpl(alphabet, pad) {
+            return DecoderWithIgnoreImpl(alphabet, pad).init(ignore_chars);
+        }
     };
 }
 
