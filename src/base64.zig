@@ -128,7 +128,24 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
         const Self = @This();
 
         const alphabet = alphabet_chars;
+
+        /// Encoded lenght of `small_in_len` byte input. Computed at comptime by
+        /// calling the inistance method `calcSize` with a dummy `&.{}` receiver.
+        ///
+        /// NOTE! `&.{}` only coerces to `*const Self` while `Self` has no fields.
+        /// If `EncoderImpl` every gains a field, this line fails with a confusing
+        /// "expected type '*const Self'" error; switch to a free helper that doesn't
+        /// take `self`.
         const small_out_len: usize = calcSize(&.{}, small_in_len);
+
+        comptime {
+            if (@typeInfo(Self).@"struct".fields.len != 0) {
+                @compileError(
+                    "EncoderImpl must stay field-less: small_out_len calls " ++
+                        "calcSize(&.{}, ...) at comptime. See the note on small_out_len",
+                );
+            }
+        }
 
         pub const stream_out_len: usize = blk: {
             // stream chunks always take the padded size of stream_in_len; since
