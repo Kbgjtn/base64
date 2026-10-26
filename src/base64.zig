@@ -812,7 +812,8 @@ pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char:
 }
 
 /// One Base64 variant: alphabet + padding + a specialized encoder.
-/// Mirrors std.base64.Codecs, minus the decoder side for now.
+///
+/// Mirrors std.base64.Codecs.
 pub fn Codecs(comptime alphabet: [64]u8, comptime pad: ?u8) type {
     return struct {
         pub const alphabet_chars = alphabet;
@@ -942,16 +943,18 @@ fn testDecodeIgnoreSpace(comptime Codec: type, expected_decoded: []const u8, enc
 }
 
 fn testError(comptime Codec: type, encoded: []const u8, expected: anyerror) !void {
-    const decoder_ignore_space = Codec.decoderWithIgnore(" ");
-    var buffer: [256]u8 = undefined;
-
+    var buffer: [0x100]u8 = undefined;
     if (Codec.Decoder.calcSizeForSlice(encoded)) |decoded_size| {
         const decoded = buffer[0..decoded_size];
-        _ = Codec.Decoder.decode(decoded, encoded) catch |err| if (err != expected) return err;
+        if (Codec.Decoder.decode(decoded, encoded)) |_| {
+            return error.ExpectedError;
+        } else |err| if (err != expected) return err;
     } else |err| if (err != expected) return err;
 
-    _ = decoder_ignore_space.decode(buffer[0..], encoded) catch |err|
-        if (err != expected) return err;
+    const decoder_ignore_space = Codec.decoderWithIgnore(" ");
+    if (decoder_ignore_space.decode(buffer[0..], encoded)) |_| {
+        return error.ExpectedError;
+    } else |err| if (err != expected) return err;
 }
 
 fn testNoSpaceLeftError(comptime Codec: type, encoded: []const u8) !void {
