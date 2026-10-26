@@ -129,7 +129,7 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
 
         const alphabet = alphabet_chars;
 
-        /// Encoded lenght of `small_in_len` byte input. Computed at comptime by
+        /// Encoded length of `small_in_len` byte input. Computed at comptime by
         /// calling the inistance method `calcSize` with a dummy `&.{}` receiver.
         ///
         /// NOTE! `&.{}` only coerces to `*const Self` while `Self` has no fields.
@@ -462,7 +462,7 @@ fn EncoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
         ///
         /// The caller owns the returned slice and must free it with `gpa`.
         /// Returns an allocator error if the output buffer cannot be allocated.
-        pub fn allocEncode(self: Self, gpa: std.mem.Allocator, source: []const u8) ![]u8 {
+        pub fn allocEncode(self: *const Self, gpa: std.mem.Allocator, source: []const u8) ![]u8 {
             const out = try gpa.alloc(u8, self.calcSize(source.len));
             _ = self.encodeToSlice(out, source);
             // return out directly since n == computeSize(source.len) == out.len always.
