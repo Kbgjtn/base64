@@ -159,7 +159,7 @@ The alphabet and padding are fixed at compile time, so a no-pad codec has no pad
 
 ```mermaid
 flowchart LR
-    subgraph "EncoderImpl(alphabet, pad_char)"
+    subgraph impl["EncoderImpl(alphabet, pad_char)"]
         calcSize["calcSize(source_len)"]
         encodeToSlice["encodeToSlice(dest, source)"]
         encode["encode(dest, source)"]
@@ -175,6 +175,8 @@ flowchart LR
     allocEncode --> calcSize
     allocEncode --> encodeToSlice
     encodeToSlice --> calcSize
+
+    style impl fill:none,stroke:#888,stroke-dasharray:4 3
 ```
 
 Where the speed comes from:
