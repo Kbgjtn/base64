@@ -632,6 +632,94 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
     };
 }
 
+test "DecoderImpl: every decode path agrees with std on clean and corrupted input" {
+    var prng = std.Random.DefaultPrng.init(0xdec0de);
+    const rng = prng.random();
+
+    inline for (.{
+        .{ standard, std.base64.standard },
+        .{ standard_no_pad, std.base64.standard_no_pad },
+        .{ url_safe, std.base64.url_safe },
+        .{ url_safe_no_pad, std.base64.url_safe_no_pad },
+    }) |pair| {
+        const mine, const theirs = pair;
+        for (0..300) |len| {
+            var raw: [300]u8 = undefined;
+            rng.bytes(raw[0..len]);
+            var enc_buf: [512]u8 = undefined;
+            const enc = theirs.Encoder.encode(&enc_buf, raw[0..len]);
+
+            for (0..4) |round| {
+                if (round != 0 and enc.len != 0) enc_buf[rng.uintLessThan(usize, enc.len)] = rng.int(u8);
+
+                const sz = theirs.Decoder.calcSizeForSlice(enc) catch {
+                    try testing.expectError(error.InvalidPadding, mine.Decoder.calcSizeForSlice(enc));
+                    continue;
+                };
+                var want_buf: [512]u8 = undefined;
+                var got_buf: [512]u8 = undefined;
+                const want: ?anyerror = if (theirs.Decoder.decode(want_buf[0..sz], enc)) |_| null else |e| e;
+
+                inline for (.{ 0, 16, 32 }) |n| {
+                    const r = mine.Decoder.decodeWith(n, got_buf[0..sz], enc);
+                    if (want) |e| {
+                        try testing.expectError(e, r);
+                    } else {
+                        try r;
+                        try testing.expectEqualSlices(u8, want_buf[0..sz], got_buf[0..sz]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "DecoderImpl: classify matches char_to_index for every byte at every lane position" {
+    inline for (.{ std.base64.standard_alphabet_chars, std.base64.url_safe_alphabet_chars }) |chars| {
+        const D = DecoderImpl(chars, '=');
+        inline for (.{ 16, 32 }) |N| {
+            for (0..256) |base| {
+                var in: [N]u8 = undefined;
+                for (&in, 0..) |*b, i| b.* = @truncate(base + i);
+                const out: [N]u8 = D.classify(N, in);
+                for (in, out) |c, got| try testing.expectEqual(D.char_to_index[c], got);
+                const ok = for (in) |c| {
+                    if (D.char_to_index[c] == invalid_char) break false;
+                } else true;
+
+                try testing.expectEqual(ok, D.allValid(N, out));
+            }
+        }
+    }
+}
+
+test "DecoderImpl compiles and decodes correctly with non-standard alphabet layout on non-scalar tier" {
+    // Deliberately NOT the A-Za-z0-9 prefix order simd_alphabet expects
+    // this permutes the first four chars so classify()/simd_alphabet must be false,
+    // forcing the scalar path even when `tier` would otherwise pick avx2/simd128.
+    const weird_alphabet = "BADCEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".*;
+
+    const D = DecoderImpl(weird_alphabet, '=');
+
+    // This instantiation must compile regardless of what `tier` resolves to
+    // on the test target, proves the SIMD block isn't force-instantiated.
+    try comptime std.testing.expect(!D.simd_alphabet);
+
+    // Round-trip through std's encoder (built from the same custom alphabet)
+    // to confirm the scalar fallback actually decodes correctly, not just compiles.
+    const decoded_expected = "foobar";
+
+    const std_encoder = comptime std.base64.Base64Encoder.init(weird_alphabet, '=');
+    const encoded_len = comptime std_encoder.calcSize(decoded_expected.len);
+    var encoded: [encoded_len]u8 = undefined;
+    _ = std_encoder.encode(&encoded, decoded_expected);
+
+    var dest: [decoded_expected.len]u8 = undefined;
+    const decoder: D = .{};
+    try decoder.decode(&dest, &encoded);
+    try std.testing.expectEqualStrings(decoded_expected, &dest);
+}
+
 pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type {
     const Decoder = DecoderImpl(alphabet_chars, pad_char);
 
