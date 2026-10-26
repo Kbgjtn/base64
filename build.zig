@@ -22,19 +22,7 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    switch (simd.Tier.fromCpu(target.result.cpu)) {
-        .avx2 => {},
-
-        .simd128 => std.log.info(
-            "base64 encoder selected the 128-bit SIMD tier\n",
-            .{},
-        ),
-
-        .scalar => std.log.warn(
-            "base64 encoder selected the scalar tier; no supported SIMD features were found\n",
-            .{},
-        ),
-    }
+    logSelectedTier(target.result);
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -210,4 +198,28 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// Prints which codec tier `simd.Tier.fromCpu` resolved for this build, so a
+/// wrong `-Dcpu` (or a native CPU without SIMD) is visible before any numbers
+/// come out of `zig build bench`. The tier drives both encode and decode.
+fn logSelectedTier(t: std.Target) void {
+    const arch = @tagName(t.cpu.arch);
+    const model = t.cpu.model.name;
+
+    switch (simd.Tier.fromCpu(t.cpu)) {
+        .avx2 => std.log.info(
+            "base64: avx2 tier (256-bit SIMD) for encode and decode [{s}, cpu={s}]",
+            .{ arch, model },
+        ),
+        .simd128 => std.log.info(
+            "base64: simd128 tier (128-bit SIMD) for encode and decode [{s}, cpu={s}]",
+            .{ arch, model },
+        ),
+        .scalar => std.log.warn(
+            "base64: scalar tier, no supported SIMD features [{s}, cpu={s}]; " ++
+                "on x86_64 pass -Dcpu=x86_64_v2 (simd128) or -Dcpu=x86_64_v3 (avx2)",
+            .{ arch, model },
+        ),
+    }
 }
