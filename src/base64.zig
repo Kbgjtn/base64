@@ -484,6 +484,21 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
     return struct {
         const Self = @This();
 
+        /// True when `alphabet_chars` is A-Za-z0-9 followed by any two other characters
+        /// (standard: `+/`, URL-safe: `-_`). This is the only layout the range compare
+        /// ladder in `classify` handle for.
+        const simd_alphabet = std.mem.eql(
+            u8,
+            alphabet_chars[0..62],
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        );
+
+        const simd_width: usize = switch (tier) {
+            .avx2 => 32,
+            .simd128 => 16,
+            .scalar => 0,
+        };
+
         // Built once per (alphabet, pad_char) instantiation, no init() call,
         // no runtime struct fields. Mirrors Base64Decoder.init's two tables.
         const char_to_index: [256]u8 = blk: {
@@ -541,8 +556,37 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
             return result;
         }
 
+        // passing *usize through a call can force the
+        // indices to spill to the stack on every iteration.
+        inline fn simdLoop(
+            comptime N: comptime_int,
+            dest: []u8,
+            source: []const u8,
+            src_index: *usize,
+            dest_index: *usize,
+        ) void {
+            const out_n = N / 4 * 3; // 24 for AVX2, 12 for SIMD128
+            while (src_index.* + N < source.len and dest_index.* + out_n <= dest.len) {
+                const chars: @Vector(N, u8) = source[src_index.*..][0..N].*;
+                const sextets = classify(N, chars);
+                if (!allValid(N, sextets)) break; // no-op; resumes to scalar
+                dest[dest_index.*..][0..out_n].* = pack(N, sextets);
+                src_index.* += N;
+                dest_index.* += out_n;
+            }
+        }
+
         /// Destination length must be exactly as per calcSizeForSlice(source).
-        pub fn decode(_: *const Self, dest: []u8, source: []const u8) Error!void {
+        pub fn decode(self: *const Self, dest: []u8, source: []const u8) Error!void {
+            return self.decodeWith(simd_width, dest, source);
+        }
+
+        fn decodeWith(
+            _: *const Self,
+            comptime simd_n: usize,
+            dest: []u8,
+            source: []const u8,
+        ) Error!void {
             if (pad_char != null and source.len % 4 != 0) return error.InvalidPadding;
 
             var dest_idx: usize = 0;
@@ -550,6 +594,8 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
             var acc: u12 = 0;
             var acc_len: u4 = 0;
             var leftover_idx: ?usize = null;
+
+            if (tier != .scalar and comptime simd_n > 0 and simd_alphabet) simdLoop(simd_n, dest, source, &fast_src_idx, &dest_idx);
 
             // 16-byte fast loop: 4 lanes of fast_char_to_index OR'd together,
             // one u128 little-endian store per 16 source chars, 12 dest bytes.
@@ -568,7 +614,7 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
 
                     // Accumulate the sentinel check here, pre-shift, where all four lanes
                     // sentinel bits stil occupy the same [24,31] range, this is collision-free,
-                    // unilike check bits after the shift bellow.
+                    // unilike check bits after the shift below.
                     any_invalid |= @truncate(new_bits & invalid_char_tst);
                     bits |= (new_bits << (24 * i));
                 }
@@ -628,6 +674,63 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
 
                 if (padding_chars != padding_len) return error.InvalidPadding;
             }
+        }
+
+        /// Maps each ASCII lane to its sextet, or 0xff if it isn't an alphabet char.
+        inline fn classify(comptime N: comptime_int, v: @Vector(N, u8)) @Vector(N, u8) {
+            if (comptime !simd_alphabet) {
+                @compileError(
+                    "classify: unsupported alphabet layout. The SIMD classifier " ++
+                        "requires A-Za-z0-9 as the first 62 characters, followed by " ++
+                        "any two other characters. Custom alphabets must use the " ++
+                        "scalar decode path (see `decode_tier`).",
+                );
+            }
+            const V = @Vector(N, u8);
+            const upper = (v -% @as(V, @splat('A'))) <= @as(V, @splat('Z' - 'A'));
+            const lower = (v -% @as(V, @splat('a'))) <= @as(V, @splat('z' - 'a'));
+            const digit = (v -% @as(V, @splat('0'))) <= @as(V, @splat('9' - '0'));
+            const is62 = v == @as(V, @splat(alphabet_chars[62]));
+            const is63 = v == @as(V, @splat(alphabet_chars[63]));
+
+            var out: V = @splat(0xff);
+            out = @select(u8, upper, v -% @as(V, @splat('A')), out);
+            out = @select(u8, lower, (v -% @as(V, @splat('a'))) +% @as(V, @splat(26)), out);
+            out = @select(u8, digit, (v -% @as(V, @splat('0'))) +% @as(V, @splat(52)), out);
+            out = @select(u8, is62, @as(V, @splat(62)), out);
+            out = @select(u8, is63, @as(V, @splat(63)), out);
+            return out;
+        }
+
+        inline fn pack(comptime N: comptime_int, s: @Vector(N, u8)) @Vector(N / 4 * 3, u8) {
+            const L = N / 4;
+            const W = @Vector(L, u32);
+            const x: W = @bitCast(s);
+            const m: W = @splat(0x3f);
+
+            const t = ((x & m) << @as(W, @splat(18))) |
+                (((x >> @as(W, @splat(8))) & m) << @as(W, @splat(12))) |
+                (((x >> @as(W, @splat(16))) & m) << @as(W, @splat(6))) |
+                ((x >> @as(W, @splat(24))) & m);
+
+            // Little-endian lane bytes are [b0, b1, b2, 0]. Emit b2, b1, b0.
+            const mask = comptime blk: {
+                var idx: [L * 3]i32 = undefined;
+                for (0..L) |K| {
+                    idx[3 * K + 0] = @intCast(4 * K + 2);
+                    idx[3 * K + 1] = @intCast(4 * K + 1);
+                    idx[3 * K + 2] = @intCast(4 * K + 0);
+                }
+                break :blk idx;
+            };
+
+            const bytes: @Vector(N, u8) = @bitCast(t);
+            return @shuffle(u8, bytes, undefined, mask);
+        }
+
+        /// True when every lane of `sextets` came from a valid alphabet character.
+        inline fn allValid(comptime N: comptime_int, sextets: @Vector(N, u8)) bool {
+            return (@reduce(.Or, sextets) >> 6) == 0;
         }
     };
 }
