@@ -49,7 +49,7 @@ comptime {
 /// Computed once, at comptime, from the actual compilation target, not re-derived here.
 /// See simd_tier.zig; build.zig calls the same function against the resolved build target
 /// so the two can't drift apart.
-const tier: simd.Tier = .fromCpu(builtin.cpu);
+pub const tier: simd.Tier = .fromCpu(builtin.cpu);
 
 const asm_ok =
     tier == .avx2 and
@@ -576,6 +576,22 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
             }
         }
 
+        // Out of line so the ymm work (and its vzeroupper) only runs for inputs
+        // long enough to reach a full SIMD block.
+        noinline fn simdLoopOutline(
+            comptime N: comptime_int,
+            dest: []u8,
+            source: []const u8,
+            src_index: *usize,
+            dest_index: *usize,
+        ) void {
+            var si = src_index.*;
+            var di = dest_index.*;
+            simdLoop(N, dest, source, &si, &di);
+            src_index.* = si;
+            dest_index.* = di;
+        }
+
         /// Destination length must be exactly as per calcSizeForSlice(source).
         pub fn decode(self: *const Self, dest: []u8, source: []const u8) Error!void {
             return self.decodeWith(simd_width, dest, source);
@@ -591,11 +607,13 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
 
             var dest_idx: usize = 0;
             var fast_src_idx: usize = 0;
-            var acc: u12 = 0;
-            var acc_len: u4 = 0;
+            var acc: u32 = 0;
+            var acc_len: u32 = 0;
             var leftover_idx: ?usize = null;
 
-            if (tier != .scalar and comptime simd_n > 0 and simd_alphabet) simdLoop(simd_n, dest, source, &fast_src_idx, &dest_idx);
+            if (tier != .scalar and comptime simd_n > 0 and simd_alphabet) {
+                if (source.len > simd_n) simdLoopOutline(simd_n, dest, source, &fast_src_idx, &dest_idx);
+            }
 
             // 16-byte fast loop: 4 lanes of fast_char_to_index OR'd together,
             // one u128 little-endian store per 16 source chars, 12 dest bytes.
@@ -646,16 +664,16 @@ pub fn DecoderImpl(comptime alphabet_chars: [64]u8, comptime pad_char: ?u8) type
                     leftover_idx = src_idx;
                     break;
                 }
-                acc = (acc << 6) + d;
+                acc = ((acc << 6) | d) & 0xfff;
                 acc_len += 6;
                 if (acc_len >= 8) {
                     acc_len -= 8;
-                    dest[dest_idx] = @truncate(acc >> acc_len);
+                    dest[dest_idx] = @truncate(acc >> @as(u5, @intCast(acc_len)));
                     dest_idx += 1;
                 }
             }
 
-            if (acc_len > 4 or (acc & (@as(u12, 1) << acc_len) - 1) != 0) {
+            if (acc_len > 4 or (acc & ((@as(u32, 1) << @as(u5, @intCast(acc_len))) - 1)) != 0) {
                 return error.InvalidPadding;
             }
 
@@ -848,7 +866,7 @@ pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char:
             return self;
         }
 
-        /// Maximum possible decoded size, actual lenght may be less if the input
+        /// Maximum possible decoded size, actual length may be less if the input
         /// includes padding or ignored characters.
         pub fn calcSizeUpperBound(_: *const Self, source_len: usize) usize {
             var size = source_len / 4 * 3;
@@ -860,8 +878,8 @@ pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char:
         }
 
         pub fn decode(self: *const Self, dest: []u8, source: []const u8) Error!usize {
-            var acc: u12 = 0;
-            var acc_len: u4 = 0;
+            var acc: u32 = 0;
+            var acc_len: u32 = 0;
             var dest_idx: usize = 0;
             var leftover_idx: ?usize = null;
 
@@ -875,17 +893,17 @@ pub fn DecoderWithIgnoreImpl(comptime alphabet_chars: [64]u8, comptime pad_char:
                     break;
                 }
 
-                acc = (acc << 6) + d;
+                acc = ((acc << 6) | d) & 0xfff;
                 acc_len += 6;
                 if (acc_len >= 8) {
                     if (dest_idx == dest.len) return error.NoSpaceLeft;
                     acc_len -= 8;
-                    dest[dest_idx] = @truncate(acc >> acc_len);
+                    dest[dest_idx] = @truncate(acc >> @as(u5, @intCast(acc_len)));
                     dest_idx += 1;
                 }
             }
 
-            if (acc_len > 4 or (acc & (@as(u12, 1) << acc_len) - 1) != 0) {
+            if (acc_len > 4 or (acc & ((@as(u32, 1) << @as(u5, @intCast(acc_len))) - 1)) != 0) {
                 return error.InvalidPadding;
             }
 

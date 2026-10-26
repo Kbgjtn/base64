@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     const bench_option = b.addOptions();
     bench_option.addOption(bool, "include_large", include_large);
 
-    bench.root_module.addOptions("build_options", bench_option);
+    bench.root_module.addOptions("bench_options", bench_option);
 
     const install_bench = b.addInstallArtifact(bench, .{});
 

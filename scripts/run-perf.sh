@@ -5,6 +5,7 @@ CPU="${CPU:-3}"
 BIN="${BIN:-./zig-out/bin/bench}"
 RUNS="${RUNS:-10}"
 OUT_DIR="${OUT_DIR:-perf-results}"
+BIN_ARGS=("$@")  # forwarded to the bench binary, e.g. --corpus bench/corpus --op decode
 
 
 mkdir -p "$OUT_DIR"
@@ -34,7 +35,7 @@ echo "Output:    $PREFIX"
 echo
 
 echo "Running benchmark..."
-taskset -c "$CPU" "$BIN" \
+taskset -c "$CPU" "$BIN" "${BIN_ARGS[@]}" \
     | tee "${PREFIX}.txt"
 
 echo
@@ -53,7 +54,7 @@ perf stat \
     -e branch-misses \
     -e cache-references \
     -e cache-misses \
-    -- "$BIN" \
+    -- "$BIN" "${BIN_ARGS[@]}" \
     2> "${PREFIX}.stat.txt"
 
 cat "${PREFIX}.stat.txt"
@@ -66,7 +67,7 @@ perf record \
     -o "${PREFIX}.data" \
     -e cycles:u \
     --call-graph dwarf \
-    -- "$BIN"
+    -- "$BIN" "${BIN_ARGS[@]}"
 
 echo
 echo "Generating perf report..."
