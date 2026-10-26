@@ -9,3 +9,15 @@ build/
 build-*/
 docgen_tmp/
 
+
+# bench corpus: regenerate with scripts/gen-corpus.py, verify with --verify
+bench/corpus/*
+!bench/corpus/SHA256SUMS
+!bench/corpus/manifest.tsv
+src/testdata_v1/
+perf-results/*
+!perf-results/weak/
+perf-results/weak/*
+!perf-results/weak/decode-fixes.diff
+*.bak
+*.data.old
