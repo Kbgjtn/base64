@@ -137,16 +137,20 @@ If you ship one binary for all x86_64 machines, you get `scalar`. Pick `x86_64_v
 
 ```mermaid
 flowchart TB
-    tgt["build target CPU (-Dtarget / -Dcpu)"] --> arch{"CPU architecture"}
-    arch -- "x86_64" --> f{"features"}
-    f -- "AVX2 and SSSE3" --> avx2["avx2"]
-    f -- "SSSE3 only" --> s128["simd128"]
-    f -- "neither" --> sc["scalar"]
-    arch -- "aarch64" --> s128
-    arch -- "wasm" --> w{"simd128 feature?"}
-    w -- yes --> s128
-    w -- no --> sc
-    arch -- "anything else" --> sc
+    subgraph tier["Tier selection, at compile time"]
+        tgt["build target CPU (-Dtarget / -Dcpu)"] --> arch{"CPU architecture"}
+        arch -- "x86_64" --> f{"features"}
+        f -- "AVX2 and SSSE3" --> avx2["avx2"]
+        f -- "SSSE3 only" --> s128["simd128"]
+        f -- "neither" --> sc["scalar"]
+        arch -- "aarch64" --> s128
+        arch -- "wasm" --> w{"simd128 feature?"}
+        w -- yes --> s128
+        w -- no --> sc
+        arch -- "anything else" --> sc
+    end
+
+    style tier fill:none,stroke:#888,stroke-dasharray:4 3
 ```
 
 Only little-endian CPUs are supported (x86_64, aarch64 and wasm all are). Big-endian targets get a compile error.
@@ -188,18 +192,22 @@ Where the speed comes from:
 
 ```mermaid
 flowchart TB
-    start["decode(dest, source)"] --> padcheck{"padded codec and length not a multiple of 4?"}
-    padcheck -- yes --> errPad["error.InvalidPadding"]
-    padcheck -- no --> big{"SIMD tier and input longer than one block?"}
-    big -- yes --> simd["SIMD loop: 32 chars (avx2) or 16 chars (simd128) to 24 or 12 bytes"]
-    simd -- "block has a bad char: stop, let the slower path find it" --> fast16
-    simd -- "fewer than one block left" --> fast16
-    big -- no --> fast16["16-char table loop"]
-    fast16 --> fast4["4-char table loop"]
-    fast4 --> tail["last few chars, one at a time, plus padding checks"]
-    fast16 -- "bad char" --> errChar["error.InvalidCharacter"]
-    fast4 -- "bad char" --> errChar
-    tail --> result["ok, or the same error std would give"]
+    subgraph dec["Decoder.decode, per codec"]
+        start["decode(dest, source)"] --> padcheck{"padded codec and length not a multiple of 4?"}
+        padcheck -- yes --> errPad["error.InvalidPadding"]
+        padcheck -- no --> big{"SIMD tier and input longer than one block?"}
+        big -- yes --> simd["SIMD loop: 32 chars (avx2) or 16 chars (simd128) to 24 or 12 bytes"]
+        simd -- "block has a bad char: stop, let the slower path find it" --> fast16
+        simd -- "fewer than one block left" --> fast16
+        big -- no --> fast16["16-char table loop"]
+        fast16 --> fast4["4-char table loop"]
+        fast4 --> tail["last few chars, one at a time, plus padding checks"]
+        fast16 -- "bad char" --> errChar["error.InvalidCharacter"]
+        fast4 -- "bad char" --> errChar
+        tail --> result["ok, or the same error std would give"]
+    end
+
+    style dec fill:none,stroke:#888,stroke-dasharray:4 3
 ```
 
 - The SIMD loop checks a whole block at once. If any character in it is invalid, it stops and hands over to the non-SIMD path, which finds the exact error the same way std does. That's how errors stay identical to std.
