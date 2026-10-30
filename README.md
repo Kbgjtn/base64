@@ -15,6 +15,8 @@ zig build test                      # runs all tests for your machine's CPU
 zig build test -Dcpu=x86_64         # test the scalar tier
 zig build test -Dcpu=x86_64_v2      # test the simd128 tier
 zig build test -Dcpu=x86_64_v3      # test the avx2 tier
+zig build test -Doptimize=ReleaseSafe
+zig build test --fuzz -Dllvm -Dtest-filter="fuzz: standard decode"   # fuzz one target
 ```
 
 `-Dcpu` is explained in [How it picks a speed tier](#how-it-picks-a-speed-tier).
@@ -101,6 +103,9 @@ The names and call shapes match `std.base64`: `standard.Encoder.encode(dest, src
 - Encode: all four codecs, random input of every length from 0 to 1023 bytes.
 - Decode: all four codecs, random input of every length from 0 to 299 bytes, both clean and with a random byte corrupted. The output must match std, and so must the error when there is one. On SIMD builds each case is also run at both SIMD widths (16 and 32) and with SIMD switched off.
 - std's own test vectors and error cases, ported over.
+- Fuzzing (`src/tests/fuzz.zig`): a decode and an encode target per codec, named `fuzz: <codec> decode` and `fuzz: <codec> encode`. Decode takes any bytes; the sizes and the result, bytes or error, must match std, including `decoderWithIgnore`, and text that decodes must encode back to itself. Encode checks every encode function against std and decodes the result back. Plain `zig build test` runs them on the test vectors and on fixed seeded mutations. Fuzzing needs `-Dllvm`, since Zig's own x86_64 backend emits no coverage.
+
+One more difference: `decoderWithIgnore` follows its codec's padding. In Zig 0.16.0 std's codecs share one `decoderWithIgnore` per alphabet, so std's `standard_no_pad.decoderWithIgnore` wants `=` padding and `url_safe.decoderWithIgnore` refuses it ([fixed upstream](https://codeberg.org/ziglang/zig/pulls/37093)). The fuzz tests check against std's `Base64DecoderWithIgnore.init` with the codec's own padding instead.
 
 One difference: in std, `standard` is a value of type `Codecs`. Here `standard` is a type. Calls like `standard.Encoder.encode(...)` work the same, but a function that takes a `std.base64.Codecs` parameter needs `comptime Codec: type` instead.
 

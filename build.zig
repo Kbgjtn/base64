@@ -163,6 +163,13 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
+    // `zig build test -Dtest-filter=<text>` builds only the tests whose names contain <text>,
+    // e.g. to fuzz one target: `zig build test --fuzz -Dllvm -Dtest-filter="fuzz: standard decode"`.
+    const test_filters = b.option([]const []const u8, "test-filter", "Only build tests whose names contain this text (repeatable)") orelse &.{};
+    // `zig build test --fuzz -Dllvm`: the self-hosted x86_64 backend emits no coverage
+    // instrumentation, so 0.16.0's fuzzer has nothing to steer by and the build runner's
+    // coverage task panics on the empty PC list. Fuzz with LLVM.
+    const llvm = b.option(bool, "llvm", "Build the library tests with LLVM (needed for --fuzz)") orelse false;
     const mod_tests = b.addTest(.{
         // `mod` takes its optimize mode from whoever imports it, so the tests get their own
         // module with `optimize` set; otherwise -Doptimize wouldn't reach them.
@@ -171,6 +178,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
+        .use_llvm = if (llvm) true else null,
+        // Zig 0.16.0's stock runner breaks --fuzz; see tools/test_runner.zig.
+        .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .server },
     });
 
     // A run step that will run the test executable.
