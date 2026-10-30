@@ -1,0 +1,4 @@
+# Code owners, read by Forgejo (Codeberg). Each rule is a Go regular expression
+# matched against the whole changed path, then the owners; a pull request touching a
+# matching path requests a review from them. Not GitHub's glob syntax.
+.* @Kbgjtn
