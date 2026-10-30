@@ -164,7 +164,13 @@ pub fn build(b: *std.Build) void {
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        // `mod` takes its optimize mode from whoever imports it, so the tests get their own
+        // module with `optimize` set; otherwise -Doptimize wouldn't reach them.
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     // A run step that will run the test executable.
